@@ -64,6 +64,10 @@ curl "http://localhost:8787/__scheduled?cron=0+17+*+*+*"
 
 （cron 文字列は `sync.config.json` の `cron_groups` のキーのどれかを指定する）
 
+## 新しい org へのセットアップ
+
+（AI エージェント向け手順書）を参照。
+
 ## セキュリティ
 
 - `.dev.vars` を commit しない。
