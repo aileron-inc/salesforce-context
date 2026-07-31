@@ -13,4 +13,4 @@ coverage/
 .DS_Store
 
 # org固有情報はR2に置く。リポジトリには example のみ入れる
-sync.config.json
+/sync.config.json
