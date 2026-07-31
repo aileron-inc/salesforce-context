@@ -1,0 +1,18 @@
+{
+  "cron_groups": {
+    "3 17,1,9 * * *": ["candidates"],
+    "13 17,1,9 * * *": ["jobs", "companies"],
+    "23 17,1,9 * * *": ["matchings"],
+    "33 17,1,9 * * *": ["contracts", "interviews"],
+    "43 17,1,9 * * *": ["interviewers"]
+  },
+  "objects": [
+    { "key": "candidates", "label": "Candidates", "soql": "SELECT Id, SystemModstamp FROM Contact" },
+    { "key": "jobs", "label": "Jobs", "soql": "SELECT Id, SystemModstamp FROM Opportunity" },
+    { "key": "companies", "label": "Companies", "soql": "SELECT Id, SystemModstamp FROM Account" },
+    { "key": "matchings", "label": "Matchings", "soql": "SELECT Id, SystemModstamp FROM Matching__c" },
+    { "key": "contracts", "label": "Contracts", "soql": "SELECT Id, SystemModstamp FROM Contract__c" },
+    { "key": "interviews", "label": "Interviews", "soql": "SELECT Id, SystemModstamp FROM Interview__c" },
+    { "key": "interviewers", "label": "Interviewers", "soql": "SELECT Id, SystemModstamp FROM InterviewParticipant__c" }
+  ]
+}
