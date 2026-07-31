@@ -1,5 +1,8 @@
 import { loadSyncConfig } from "./config";
-import type { SalesforceObjectConfig } from "./config";
+import type { SalesforceObjectConfig, SyncConfig } from "./config";
+import { DriveClient } from "./drive";
+import { R2Target, DriveTarget } from "./target";
+import type { SyncTarget } from "./target";
 
 export interface SalesforceSyncEnv {
   R2: R2Bucket;
@@ -7,6 +10,8 @@ export interface SalesforceSyncEnv {
   SF_CLIENT_SECRET: string;
   SF_REFRESH_TOKEN: string;
   SF_LOGIN_URL?: string;
+  GOOGLE_SERVICE_ACCOUNT_EMAIL?: string;
+  GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?: string;
 }
 
 interface SalesforceTokenResponse {
@@ -37,13 +42,36 @@ const API_VERSION = "v67.0";
 const DEFAULT_LOGIN_URL = "https://login.salesforce.com";
 const POLL_INITIAL_MS = 2_000;
 const POLL_MAX_MS = 30_000;
+const PAGE_MAX_RECORDS = 10_000;
+const KEEP_GENERATIONS = 6;
 
 interface GenerationState {
   objects: Manifest["objects"];
 }
 
-function statePath(runId: string): string {
-  return `generations/${runId}/_state.json`;
+function createTarget(
+  env: SalesforceSyncEnv,
+  syncConfig: SyncConfig,
+): SyncTarget {
+  if (syncConfig.target === "drive") {
+    if (
+      !env.GOOGLE_SERVICE_ACCOUNT_EMAIL ||
+      !env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY ||
+      !syncConfig.drive?.folder_id
+    ) {
+      throw new Error(
+        "drive target requires GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY and sync.config.json drive.folder_id",
+      );
+    }
+    const client = new DriveClient(
+      env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
+      syncConfig.drive.folder_id,
+    );
+    return new DriveTarget(client);
+  }
+
+  return new R2Target(env.R2);
 }
 
 export async function runSync(
@@ -60,8 +88,12 @@ export async function runSync(
     return;
   }
 
-  const runId = new Date(scheduledTime).toISOString().slice(0, 13).replace("T", "-");
+  const runId = new Date(scheduledTime)
+    .toISOString()
+    .slice(0, 13)
+    .replace("T", "-");
   const token = await refreshAccessToken(env);
+  const target = createTarget(env, syncConfig);
 
   console.log(
     JSON.stringify({
@@ -69,13 +101,13 @@ export async function runSync(
       generation: runId,
       cron,
       object_keys: objectKeys,
+      target: syncConfig.target ?? "r2",
     }),
   );
 
-  const stateObject = await env.R2.get(statePath(runId));
-  const state: GenerationState = stateObject
-    ? await stateObject.json<GenerationState>()
-    : { objects: {} };
+  const state = (await target.getState<GenerationState>(runId)) ?? {
+    objects: {},
+  };
 
   for (const objectKey of objectKeys) {
     const config = syncConfig.objects.find(
@@ -86,10 +118,14 @@ export async function runSync(
     }
 
     const syncedAt = new Date().toISOString();
-    const result = await streamBulkQueryToR2(env, token, config, runId);
+    const result = await streamBulkQuery(token, config, runId, target);
+
+    const prefix = result.parts.length > 0
+      ? result.parts[0].slice(0, result.parts[0].lastIndexOf("/") + 1)
+      : `${runId}/${config.key}/`;
 
     state.objects[config.key] = {
-      prefix: `generations/${runId}/${config.key}/`,
+      prefix,
       parts: result.parts,
       record_count: result.recordCount,
       synced_at: syncedAt,
@@ -106,17 +142,11 @@ export async function runSync(
     );
   }
 
-  await env.R2.put(statePath(runId), JSON.stringify(state, null, 2), {
-    httpMetadata: { contentType: "application/json" },
-  });
+  await target.putState(runId, state);
 
   const completedCount = Object.keys(state.objects).length;
   if (completedCount === syncConfig.objects.length) {
-    await env.R2.put(
-      "manifest.json",
-      JSON.stringify({ generation: runId, objects: state.objects }, null, 2),
-      { httpMetadata: { contentType: "application/json" } },
-    );
+    await target.putManifest({ generation: runId, objects: state.objects });
 
     console.log(
       JSON.stringify({
@@ -126,7 +156,7 @@ export async function runSync(
       }),
     );
 
-    await cleanupGenerations(env);
+    await target.cleanupOldGenerations(KEEP_GENERATIONS);
   } else {
     console.log(
       JSON.stringify({
@@ -135,44 +165,6 @@ export async function runSync(
         completed_count: completedCount,
         total_count: syncConfig.objects.length,
       }),
-    );
-  }
-}
-
-const KEEP_GENERATIONS = 6;
-
-export async function cleanupGenerations(env: SalesforceSyncEnv): Promise<void> {
-  const generations = new Set<string>();
-  let cursor: string | undefined;
-
-  do {
-    const listed = await env.R2.list({ prefix: "generations/", cursor });
-    for (const object of listed.objects) {
-      const generation = object.key.split("/")[1];
-      if (generation) {
-        generations.add(generation);
-      }
-    }
-    cursor = listed.truncated ? listed.cursor : undefined;
-  } while (cursor);
-
-  const sorted = [...generations].sort();
-  const stale = sorted.slice(0, Math.max(0, sorted.length - KEEP_GENERATIONS));
-
-  for (const generation of stale) {
-    let cursor: string | undefined;
-
-    do {
-      const listed = await env.R2.list({
-        prefix: `generations/${generation}/`,
-        cursor,
-      });
-      await env.R2.delete(listed.objects.map((object) => object.key));
-      cursor = listed.truncated ? listed.cursor : undefined;
-    } while (cursor);
-
-    console.log(
-      JSON.stringify({ message: "generation deleted", generation }),
     );
   }
 }
@@ -200,11 +192,11 @@ async function refreshAccessToken(
   return response.json<SalesforceTokenResponse>();
 }
 
-async function streamBulkQueryToR2(
-  env: SalesforceSyncEnv,
+async function streamBulkQuery(
   token: SalesforceTokenResponse,
   config: SalesforceObjectConfig,
   runId: string,
+  target: SyncTarget,
 ): Promise<{ parts: string[]; recordCount: number }> {
   const jobsUrl = `${token.instance_url}/services/data/${API_VERSION}/jobs/query`;
   const createResponse = await salesforceFetch(token, jobsUrl, {
@@ -231,11 +223,15 @@ async function streamBulkQueryToR2(
     const response = await salesforceFetch(token, url.toString());
     const body = await response.arrayBuffer();
 
-    const path = `generations/${runId}/${config.key}/part-${String(partIndex).padStart(4, "0")}.csv`;
-    await env.R2.put(path, body, {
-      httpMetadata: { contentType: "text/csv" },
-    });
-    parts.push(path);
+    const partName = `part-${String(partIndex).padStart(4, "0")}.csv`;
+    const partPath = await target.putPart(
+      runId,
+      config.key,
+      partName,
+      body,
+    );
+    parts.push(partPath);
+
     partIndex += 1;
 
     const nextLocator = response.headers.get("Sforce-Locator");
@@ -244,8 +240,6 @@ async function streamBulkQueryToR2(
 
   return { parts, recordCount };
 }
-
-const PAGE_MAX_RECORDS = 10_000;
 
 async function salesforceFetch(
   token: SalesforceTokenResponse,

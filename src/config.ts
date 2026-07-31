@@ -7,6 +7,10 @@ export interface SalesforceObjectConfig {
 export interface SyncConfig {
   cron_groups: Record<string, string[]>;
   objects: SalesforceObjectConfig[];
+  target?: "r2" | "drive";
+  drive?: {
+    folder_id: string;
+  };
 }
 
 export const SYNC_CONFIG_KEY = "sync.config.json";
