@@ -66,7 +66,7 @@ curl "http://localhost:8787/__scheduled?cron=0+17+*+*+*"
 
 ## 新しい org へのセットアップ
 
-（AI エージェント向け手順書）を参照。
+`docs/ONBOARDING.md`（AI エージェント向け手順書）を参照。
 
 ## セキュリティ
 
