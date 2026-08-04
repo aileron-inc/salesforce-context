@@ -2,6 +2,7 @@ export interface SalesforceObjectConfig {
   key: string;
   label: string;
   soql: string;
+  max_records?: number;
 }
 
 export interface SyncConfig {

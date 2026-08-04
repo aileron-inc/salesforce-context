@@ -215,7 +215,7 @@ async function streamBulkQuery(
 
   do {
     const url = new URL(`${jobUrl}/results`);
-    url.searchParams.set("maxRecords", String(PAGE_MAX_RECORDS));
+    url.searchParams.set("maxRecords", String(config.max_records ?? PAGE_MAX_RECORDS));
     if (locator) {
       url.searchParams.set("locator", locator);
     }
