@@ -1,0 +1,7 @@
+# Salesforce同期処理は未実装。以下は将来のローカル開発用の名前だけを示す。
+# 実際の値をこのファイルへ書かず、`.dev.vars` に設定する。
+
+SF_LOGIN_URL=https://login.salesforce.com
+SF_CLIENT_ID=replace-with-local-client-id
+SF_CLIENT_SECRET=replace-with-local-client-secret
+SF_REFRESH_TOKEN=replace-with-local-refresh-token

@@ -1,0 +1,16 @@
+{
+  "cron_groups": {
+    "3 17,1,9 * * *": ["example_objects"],
+    "13 17,1,9 * * *": [],
+    "23 17,1,9 * * *": [],
+    "33 17,1,9 * * *": [],
+    "43 17,1,9 * * *": []
+  },
+  "objects": [
+    {
+      "key": "example_objects",
+      "label": "Example objects",
+      "soql": "SELECT Id, SystemModstamp, Name FROM Account"
+    }
+  ]
+}

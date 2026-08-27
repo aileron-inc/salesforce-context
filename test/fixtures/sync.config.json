@@ -1,0 +1,26 @@
+{
+  "cron_groups": {
+    "3 17,1,9 * * *": ["accounts"],
+    "13 17,1,9 * * *": ["contacts", "opportunities"],
+    "23 17,1,9 * * *": [],
+    "33 17,1,9 * * *": [],
+    "43 17,1,9 * * *": []
+  },
+  "objects": [
+    {
+      "key": "accounts",
+      "label": "Accounts",
+      "soql": "SELECT Id, SystemModstamp, Name FROM Account"
+    },
+    {
+      "key": "contacts",
+      "label": "Contacts",
+      "soql": "SELECT Id, SystemModstamp FROM Contact"
+    },
+    {
+      "key": "opportunities",
+      "label": "Opportunities",
+      "soql": "SELECT Id, SystemModstamp FROM Opportunity"
+    }
+  ]
+}

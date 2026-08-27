@@ -1,0 +1,20 @@
+node_modules/
+.wrangler/
+dist/
+coverage/
+
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+
+*.log
+.DS_Store
+
+# デプロイ先固有情報はR2またはローカルに置く
+/sync.config.json
+/sync.config.*.json
+!/sync.config.example.json
+/wrangler.*.json
+!/wrangler.json
