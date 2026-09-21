@@ -1,6 +1,6 @@
 # salesforce-context コンテキスト
 
-最終更新: 2026-08-27
+最終更新: 2026-09-21
 
 ## Why: 実現したいこと
 
@@ -44,7 +44,7 @@ R2 の世代管理された CSV
 - 全オブジェクトを1回で処理せず、**5つの Cron Trigger に分割**して1 invocation あたり1〜2オブジェクトを処理する。
 - `controller.cron` で担当オブジェクトを判別する。割り振りは `sync.config.json` の `cron_groups`。
 - 世代 ID は `scheduledTime`（UTC、時まで）から決定論的に生成し、複数 invocation で同一世代を共有する。
-- 各 invocation は完了オブジェクトを `generations/{runId}/_state.json` に追記し、全オブジェクト揃った invocation が `manifest.json` を切り替える。
+- 各 invocation はオブジェクトを1件同期するたびに `generations/{runId}/_state.json` へ追記する。群の途中で失敗しても成功分は残り、全オブジェクト揃った invocation が `manifest.json` を切り替える。
 
 ### 保存形式・世代管理
 

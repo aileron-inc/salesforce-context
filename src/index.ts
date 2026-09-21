@@ -140,9 +140,9 @@ export async function runSync(
         part_count: result.parts.length,
       }),
     );
-  }
 
-  await target.putState(runId, state);
+    await target.putState(runId, state);
+  }
 
   const completedCount = Object.keys(state.objects).length;
   if (completedCount === syncConfig.objects.length) {
