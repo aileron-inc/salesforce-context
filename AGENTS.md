@@ -23,7 +23,7 @@
 - OAuth refresh token によるアクセストークン取得
 - Bulk API 2.0 query job の作成・指数バックオフでのポーリング・結果CSV取得
 - 結果 CSV の素通し保存（`maxRecords=10000` のページ = 1ファイル）
-- `_state.json` による世代内の進捗管理と、全件成功後の `manifest.json` 切替
+- `_state.json` による世代内の進捗管理（invocation 内でも1オブジェクト成功ごとに `putState`）と、全件成功後の `manifest.json` 切替
 - 直近6世代を残す旧世代 cleanup
 - Workers runtime 上でのテスト（Salesforce API は fetch モック）
 

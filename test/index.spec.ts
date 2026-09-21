@@ -256,6 +256,111 @@ describe("scheduled sync", () => {
       "2026-08-01-01",
     ]);
   });
+
+  it("同一cron群の2件目が失敗しても1件目は_state.jsonに残る", async () => {
+    const twoObjectCron = CRONS.find(
+      (cron) => (syncConfig as SyncConfig).cron_groups[cron].length === 2,
+    );
+    expect(twoObjectCron).toBeDefined();
+
+    const [firstKey, secondKey] = (syncConfig as SyncConfig).cron_groups[
+      twoObjectCron!
+    ];
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+
+      if (url === "https://login.salesforce.com/services/oauth2/token") {
+        return Response.json({
+          access_token: "test-access-token",
+          instance_url: "https://example.my.salesforce.com",
+        });
+      }
+
+      if (
+        url ===
+          "https://example.my.salesforce.com/services/data/v67.0/jobs/query" &&
+        init?.method === "POST"
+      ) {
+        const body = JSON.parse(init.body?.toString() ?? "{}") as {
+          query?: string;
+        };
+        const config = SALESFORCE_OBJECTS.find(
+          (objectConfig) => objectConfig.soql === body.query,
+        );
+
+        if (!config) {
+          throw new Error(`unexpected query: ${body.query ?? ""}`);
+        }
+
+        return Response.json({
+          id: `job-${config.key}`,
+          state: "UploadComplete",
+        });
+      }
+
+      if (url.endsWith(`/jobs/query/job-${firstKey}`)) {
+        return Response.json({
+          id: `job-${firstKey}`,
+          state: "JobComplete",
+          numberRecordsProcessed: 2,
+        });
+      }
+
+      if (url.includes(`/jobs/query/job-${firstKey}/results`)) {
+        return new Response(csvFor(firstKey, null), {
+          headers: { "Sforce-Locator": "null" },
+        });
+      }
+
+      if (url.endsWith(`/jobs/query/job-${secondKey}`)) {
+        return Response.json({
+          id: `job-${secondKey}`,
+          state: "Failed",
+          errorMessage: "query timed out",
+        });
+      }
+
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("scheduler", { wait: async () => {} });
+
+    await env.R2.put("sync.config.json", JSON.stringify(syncConfig));
+
+    const waitUntilPromises: Promise<unknown>[] = [];
+    worker.scheduled?.(
+      { cron: twoObjectCron!, scheduledTime: SCHEDULED_TIME, noRetry() {} },
+      env as SalesforceSyncEnv,
+      {
+        waitUntil(promise) {
+          waitUntilPromises.push(promise);
+        },
+      } as ExecutionContext,
+    );
+    await expect(Promise.all(waitUntilPromises)).rejects.toThrow(
+      `Bulk query ${secondKey} Failed: query timed out`,
+    );
+
+    const stateObject = await env.R2.get(`generations/${RUN_ID}/_state.json`);
+    expect(stateObject).not.toBeNull();
+    const state = JSON.parse(await stateObject!.text()) as Manifest;
+    expect(Object.keys(state.objects)).toEqual([firstKey]);
+    expect(state.objects[firstKey]).toMatchObject({
+      prefix: `generations/${RUN_ID}/${firstKey}/`,
+      record_count: 2,
+    });
+    expect(state.objects[firstKey].parts).toEqual([
+      `generations/${RUN_ID}/${firstKey}/part-0000.csv`,
+    ]);
+    expect(state.objects[secondKey]).toBeUndefined();
+
+    const firstPart = await env.R2.get(state.objects[firstKey].parts[0]);
+    expect(await firstPart!.text()).toBe(csvFor(firstKey, null));
+
+    expect(await env.R2.get("manifest.json")).toBeNull();
+  });
 });
 
 function csvFor(objectKey: string, locator: string | null): string {
