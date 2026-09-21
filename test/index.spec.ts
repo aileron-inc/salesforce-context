@@ -258,6 +258,8 @@ describe("scheduled sync", () => {
   });
 
   it("同一cron群の2件目が失敗しても1件目は_state.jsonに残る", async () => {
+    const scheduledTime = Date.UTC(2026, 6, 30, 18, 0, 0);
+    const runId = "2026-07-30-18";
     const twoObjectCron = CRONS.find(
       (cron) => (syncConfig as SyncConfig).cron_groups[cron].length === 2,
     );
@@ -266,6 +268,9 @@ describe("scheduled sync", () => {
     const [firstKey, secondKey] = (syncConfig as SyncConfig).cron_groups[
       twoObjectCron!
     ];
+
+    await env.R2.delete("manifest.json");
+    await env.R2.delete(`generations/${runId}/_state.json`);
 
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = input.toString();
@@ -331,7 +336,7 @@ describe("scheduled sync", () => {
 
     const waitUntilPromises: Promise<unknown>[] = [];
     worker.scheduled?.(
-      { cron: twoObjectCron!, scheduledTime: SCHEDULED_TIME, noRetry() {} },
+      { cron: twoObjectCron!, scheduledTime, noRetry() {} },
       env as SalesforceSyncEnv,
       {
         waitUntil(promise) {
@@ -343,16 +348,16 @@ describe("scheduled sync", () => {
       `Bulk query ${secondKey} Failed: query timed out`,
     );
 
-    const stateObject = await env.R2.get(`generations/${RUN_ID}/_state.json`);
+    const stateObject = await env.R2.get(`generations/${runId}/_state.json`);
     expect(stateObject).not.toBeNull();
     const state = JSON.parse(await stateObject!.text()) as Manifest;
     expect(Object.keys(state.objects)).toEqual([firstKey]);
     expect(state.objects[firstKey]).toMatchObject({
-      prefix: `generations/${RUN_ID}/${firstKey}/`,
+      prefix: `generations/${runId}/${firstKey}/`,
       record_count: 2,
     });
     expect(state.objects[firstKey].parts).toEqual([
-      `generations/${RUN_ID}/${firstKey}/part-0000.csv`,
+      `generations/${runId}/${firstKey}/part-0000.csv`,
     ]);
     expect(state.objects[secondKey]).toBeUndefined();
 
