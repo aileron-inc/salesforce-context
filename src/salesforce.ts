@@ -3,6 +3,8 @@ import {
   API_VERSION,
   DEFAULT_LOGIN_URL,
   PAGE_MAX_RECORDS,
+  SALESFORCE_HEADER_TIMEOUT_MS,
+  SALESFORCE_RESULT_BODY_TIMEOUT_MS,
 } from "./constants";
 import type { SalesforceSyncEnv } from "./env";
 import { fetchWithRetry, throwIfNotOk } from "./http";
@@ -90,9 +92,62 @@ export async function openResultsPage(
   const response = await salesforceFetch(token, url.toString());
   const next = response.headers.get("Sforce-Locator");
   return {
-    response,
+    response: limitBodyRead(response, SALESFORCE_RESULT_BODY_TIMEOUT_MS),
     nextLocator: next && next !== "null" ? next : null,
   };
+}
+
+export function limitBodyRead(response: Response, timeoutMs: number): Response {
+  if (!response.body) {
+    return response;
+  }
+
+  const reader = response.body.getReader();
+  const started = Date.now();
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const remaining = timeoutMs - (Date.now() - started);
+      if (remaining <= 0) {
+        await reader.cancel();
+        controller.error(new Error("Salesforce results body timed out"));
+        return;
+      }
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("Salesforce results body timed out")),
+              remaining,
+            );
+          }),
+        ]);
+        if (result.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(result.value);
+      } catch (error) {
+        await reader.cancel().catch(() => undefined);
+        controller.error(error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+
+  return new Response(stream, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 export function pageMaxRecords(config: SalesforceObjectConfig): number {
@@ -111,9 +166,9 @@ async function salesforceFetch(
     {
       ...init,
       headers,
-      signal: init.signal ?? AbortSignal.timeout(180_000),
     },
     "Salesforce API",
+    SALESFORCE_HEADER_TIMEOUT_MS,
   );
   await throwIfNotOk(response, "Salesforce API failed");
   return response;

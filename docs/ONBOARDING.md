@@ -72,7 +72,9 @@ wrangler secret put GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
 
 ### 6. Queue を作ってからデプロイする
 
-Workflow `salesforce-context-sync` は `wrangler deploy` が作成する。Queue は先に作る。
+アカウントは Workers Paid にする。Free プランの Workflow step は CPU 10ms で、大きい CSV の分割が失敗する。
+
+Workflow `salesforce-context-sync` は `wrangler deploy` が作成する。Queue は先に作る。デプロイは UTC 17時・1時・9時の :03 から :45 を避ける。その窓は本番 cron が動いていて、進行中の世代の旧 `_state.json` を新しいコードは読まない。
 
 ```sh
 npx wrangler queues create salesforce-context-sync-dlq

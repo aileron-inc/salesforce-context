@@ -1,6 +1,14 @@
 import type { SyncConfig } from "./config";
 import { CSV_MIME, JSON_MIME } from "./constants";
 import { DriveClient } from "./drive";
+import {
+  manifestFileKey,
+  partFileKey,
+  readStoredId,
+  resolveFileId,
+  stateFileKey,
+  type DriveFolders,
+} from "./drive-layout";
 import type { SalesforceSyncEnv } from "./env";
 import { log } from "./log";
 
@@ -14,6 +22,7 @@ export interface SyncTarget {
   putState(runId: string, state: unknown): Promise<void>;
   getState<T>(runId: string): Promise<T | null>;
   putManifest(manifest: unknown): Promise<void>;
+  getManifest<T>(): Promise<T | null>;
   cleanupOldGenerations(keepCount: number): Promise<void>;
 }
 
@@ -55,6 +64,14 @@ export class R2Target implements SyncTarget {
     });
   }
 
+  async getManifest<T>(): Promise<T | null> {
+    const object = await this.r2.get("manifest.json");
+    if (!object) {
+      return null;
+    }
+    return object.json<T>();
+  }
+
   async cleanupOldGenerations(keepCount: number): Promise<void> {
     const generations = new Set<string>();
     let cursor: string | undefined;
@@ -81,37 +98,12 @@ export class R2Target implements SyncTarget {
 }
 
 export class DriveTarget implements SyncTarget {
-  private readonly folderCache = new Map<string, string>();
-
-  constructor(private readonly drive: DriveClient) {}
-
-  private async getGenerationFolder(runId: string): Promise<string> {
-    const cached = this.folderCache.get(runId);
-    if (cached) {
-      return cached;
-    }
-    const folderId = await this.drive.findOrCreateFolder(
-      runId,
-      this.drive.rootFolder,
-    );
-    this.folderCache.set(runId, folderId);
-    return folderId;
-  }
-
-  private async getObjectFolder(
-    runId: string,
-    objectKey: string,
-  ): Promise<string> {
-    const cacheKey = `${runId}/${objectKey}`;
-    const cached = this.folderCache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-    const genFolderId = await this.getGenerationFolder(runId);
-    const folderId = await this.drive.findOrCreateFolder(objectKey, genFolderId);
-    this.folderCache.set(cacheKey, folderId);
-    return folderId;
-  }
+  constructor(
+    private readonly drive: DriveClient,
+    private readonly bucket: R2Bucket,
+    private readonly runId: string,
+    private readonly folders: DriveFolders,
+  ) {}
 
   async putPart(
     runId: string,
@@ -119,33 +111,76 @@ export class DriveTarget implements SyncTarget {
     partName: string,
     body: Uint8Array,
   ): Promise<string> {
-    const folderId = await this.getObjectFolder(runId, objectKey);
-    await this.drive.createOrUpdateFile(partName, folderId, body, CSV_MIME);
+    const fileId = await resolveFileId(
+      this.bucket,
+      this.drive,
+      partFileKey(runId, objectKey, partName),
+      partName,
+      this.folders.objectFolderId,
+      CSV_MIME,
+    );
+    await this.drive.createOrUpdateFile(partName, this.folders.objectFolderId, body, CSV_MIME, {
+      fileId,
+    });
     return `${runId}/${objectKey}/${partName}`;
   }
 
   async putState(runId: string, state: unknown): Promise<void> {
-    const folderId = await this.getGenerationFolder(runId);
+    const fileId = await resolveFileId(
+      this.bucket,
+      this.drive,
+      stateFileKey(runId),
+      "_state.json",
+      this.folders.generationFolderId,
+      JSON_MIME,
+    );
     await this.drive.createOrUpdateFile(
       "_state.json",
-      folderId,
+      this.folders.generationFolderId,
       new TextEncoder().encode(JSON.stringify(state, null, 2)),
       JSON_MIME,
+      { fileId },
     );
   }
 
   async getState<T>(runId: string): Promise<T | null> {
-    const folderId = await this.getGenerationFolder(runId);
-    return this.drive.getFileContent<T>("_state.json", folderId);
+    const stored = await readStoredId(this.bucket, stateFileKey(runId));
+    if (stored) {
+      const body = await this.drive.downloadJson<T>(stored);
+      if (body) {
+        return body;
+      }
+    }
+    return this.drive.getFileContent<T>("_state.json", this.folders.generationFolderId);
   }
 
   async putManifest(manifest: unknown): Promise<void> {
+    const fileId = await resolveFileId(
+      this.bucket,
+      this.drive,
+      manifestFileKey(),
+      "manifest.json",
+      this.drive.rootFolder,
+      JSON_MIME,
+    );
     await this.drive.createOrUpdateFile(
       "manifest.json",
       this.drive.rootFolder,
       new TextEncoder().encode(JSON.stringify(manifest, null, 2)),
       JSON_MIME,
+      { fileId },
     );
+  }
+
+  async getManifest<T>(): Promise<T | null> {
+    const stored = await readStoredId(this.bucket, manifestFileKey());
+    if (stored) {
+      const body = await this.drive.downloadJson<T>(stored);
+      if (body) {
+        return body;
+      }
+    }
+    return this.drive.getFileContent<T>("manifest.json", this.drive.rootFolder);
   }
 
   async cleanupOldGenerations(keepCount: number): Promise<void> {
@@ -167,6 +202,7 @@ export class DriveTarget implements SyncTarget {
 export function createTarget(
   env: SalesforceSyncEnv,
   syncConfig: SyncConfig,
+  drive?: { runId: string; folders: DriveFolders },
 ): SyncTarget {
   if (syncConfig.target === "drive") {
     if (
@@ -178,12 +214,18 @@ export function createTarget(
         "drive target requires GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY and sync.config.json drive.folder_id",
       );
     }
+    if (!drive) {
+      throw new Error("drive target requires resolved folder ids");
+    }
     return new DriveTarget(
       new DriveClient(
         env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
         env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
         syncConfig.drive.folder_id,
       ),
+      env.R2,
+      drive.runId,
+      drive.folders,
     );
   }
 

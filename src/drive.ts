@@ -4,6 +4,7 @@ import {
   fetchWithRetry,
   formatStatus,
   HttpStatusError,
+  isRateLimitDetail,
   isRetryableStatus,
   throwIfNotOk,
 } from "./http";
@@ -103,7 +104,7 @@ export class DriveClient {
     return send();
   }
 
-  async findOrCreateFolder(name: string, parentId: string): Promise<string> {
+  async findFolder(name: string, parentId: string): Promise<string | null> {
     const escapedName = name.replace(/'/g, "\\'");
     const listUrl =
       `https://www.googleapis.com/drive/v3/files` +
@@ -114,11 +115,10 @@ export class DriveClient {
     await throwIfNotOk(listResponse, "Drive list failed");
 
     const listData = (await listResponse.json()) as { files?: DriveFile[] };
-    const existing = listData.files?.[0];
-    if (existing) {
-      return existing.id;
-    }
+    return listData.files?.[0]?.id ?? null;
+  }
 
+  async createFolder(name: string, parentId: string): Promise<string> {
     const createResponse = await this.authedFetch(
       "https://www.googleapis.com/drive/v3/files",
       {
@@ -136,6 +136,60 @@ export class DriveClient {
 
     const created = (await createResponse.json()) as DriveFile;
     return created.id;
+  }
+
+  async createEmptyFile(
+    name: string,
+    parentId: string,
+    mimeType: string,
+  ): Promise<string> {
+    const response = await this.authedFetch(
+      "https://www.googleapis.com/drive/v3/files",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name,
+          parents: [parentId],
+          mimeType,
+        }),
+      },
+      "Drive file create",
+    );
+    await throwIfNotOk(response, "Drive file create failed");
+    const created = (await response.json()) as DriveFile;
+    return created.id;
+  }
+
+  async trash(fileId: string): Promise<void> {
+    const response = await this.authedFetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ trashed: true }),
+      },
+      "Drive trash",
+    );
+    if (response.status === 404) {
+      await errorSnippet(response);
+      return;
+    }
+    await throwIfNotOk(response, "Drive trash failed");
+  }
+
+  async downloadJson<T>(fileId: string): Promise<T | null> {
+    const response = await this.authedFetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,
+      {},
+      "Drive download",
+    );
+    if (response.status === 404) {
+      await errorSnippet(response);
+      return null;
+    }
+    await throwIfNotOk(response, "Drive download failed");
+    return response.json<T>();
   }
 
   async findFileId(name: string, parentId: string): Promise<string | null> {
@@ -189,8 +243,12 @@ export class DriveClient {
     parentId: string,
     body: Uint8Array,
     mimeType: string,
+    options?: { fileId?: string; chunkBytes?: number },
   ): Promise<void> {
-    const existingId = await this.findFileId(name, parentId);
+    const existingId =
+      options?.fileId !== undefined
+        ? options.fileId
+        : await this.findFileId(name, parentId);
     const sessionUrl = await this.startResumableSession(
       name,
       parentId,
@@ -198,7 +256,12 @@ export class DriveClient {
       body.byteLength,
       mimeType,
     );
-    await this.uploadResumable(sessionUrl, body, `Drive upload ${name}`);
+    await this.uploadResumable(
+      sessionUrl,
+      body,
+      `Drive upload ${name}`,
+      options?.chunkBytes ?? UPLOAD_CHUNK_BYTES,
+    );
   }
 
   private async startResumableSession(
@@ -232,10 +295,13 @@ export class DriveClient {
 
     if (!response.ok && response.status !== 308) {
       const detail = await errorSnippet(response);
+      const deadSession = response.status === 404 || response.status === 410;
       throw new HttpStatusError(
         formatStatus(`Drive upload session ${name}`, response.status, detail),
         response.status,
-        isRetryableStatus(response.status),
+        deadSession ||
+          isRetryableStatus(response.status) ||
+          isRateLimitDetail(response.status, detail),
       );
     }
 
@@ -255,6 +321,7 @@ export class DriveClient {
     sessionUrl: string,
     body: Uint8Array,
     label: string,
+    chunkBytes: number,
   ): Promise<void> {
     const total = body.byteLength;
     if (total === 0) {
@@ -284,7 +351,7 @@ export class DriveClient {
     let offset = 0;
     let attempt = 0;
     while (offset < total) {
-      const size = Math.min(UPLOAD_CHUNK_BYTES, total - offset);
+      const size = Math.min(chunkBytes, total - offset);
       const end = offset + size;
       try {
         const next = await this.putChunk(
@@ -307,16 +374,19 @@ export class DriveClient {
             );
           }
           const resumed = await this.queryResume(sessionUrl, total, label);
-          if (resumed === "done") {
+          if (resumed === "done" || resumed >= total) {
             return;
           }
-          offset = Math.max(offset, resumed);
+          offset = resumed;
           await scheduler.wait(backoffMs(attempt));
           continue;
         }
         offset = next;
         attempt = 0;
       } catch (error) {
+        if (isDeadUploadSession(error)) {
+          throw error;
+        }
         if (error instanceof HttpStatusError && !error.retryable) {
           throw error;
         }
@@ -334,12 +404,15 @@ export class DriveClient {
         }
         try {
           const resumed = await this.queryResume(sessionUrl, total, label);
-          if (resumed === "done") {
+          if (resumed === "done" || resumed >= total) {
             return;
           }
-          offset = Math.max(offset, resumed);
+          offset = resumed;
         } catch (resumeError) {
-          if (resumeError instanceof HttpStatusError && !resumeError.retryable) {
+          if (
+            isDeadUploadSession(resumeError) ||
+            (resumeError instanceof HttpStatusError && !resumeError.retryable)
+          ) {
             throw resumeError;
           }
         }
@@ -398,7 +471,11 @@ export class DriveClient {
     }
 
     const detail = await errorSnippet(response);
-    const retryable = isRetryableStatus(response.status);
+    const deadSession = response.status === 404 || response.status === 410;
+    const retryable =
+      deadSession ||
+      isRetryableStatus(response.status) ||
+      isRateLimitDetail(response.status, detail);
     log({
       message: "drive upload failed",
       label,
@@ -447,10 +524,13 @@ export class DriveClient {
     }
 
     const detail = await errorSnippet(response);
+    const deadSession = response.status === 404 || response.status === 410;
     throw new HttpStatusError(
       formatStatus(`${label} resume`, response.status, detail),
       response.status,
-      isRetryableStatus(response.status) || response.status === 404,
+      deadSession ||
+        isRetryableStatus(response.status) ||
+        isRateLimitDetail(response.status, detail),
     );
   }
 
@@ -521,6 +601,10 @@ export class DriveClient {
   get rootFolder(): string {
     return this.rootFolderId;
   }
+}
+
+function isDeadUploadSession(error: unknown): error is HttpStatusError {
+  return error instanceof HttpStatusError && (error.status === 404 || error.status === 410);
 }
 
 function offsetAfterRange(header: string | null): number | null {

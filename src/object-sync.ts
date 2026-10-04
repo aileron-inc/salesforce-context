@@ -1,11 +1,13 @@
-import { loadSyncConfig } from "./config";
+import { loadSyncConfig, type SyncConfig } from "./config";
 import { consumeCsvParts } from "./csv-parts";
 import {
   CSV_MIME,
   DEFAULT_PART_MAX_BYTES,
   KEEP_GENERATIONS,
 } from "./constants";
+import type { DriveFolders } from "./drive-layout";
 import type { SalesforceSyncEnv } from "./env";
+import { shouldPublishManifest } from "./ids";
 import { log } from "./log";
 import {
   cleanupRuntimeArtifacts,
@@ -20,7 +22,7 @@ import {
   pageMaxRecords,
   refreshAccessToken,
 } from "./salesforce";
-import { createTarget, deleteR2Prefix } from "./target";
+import { createTarget, deleteR2Prefix, type SyncTarget } from "./target";
 
 export interface StagedPart {
   name: string;
@@ -34,6 +36,21 @@ export interface StagePageResult {
   downloadMs: number;
   downloadBytes: number;
   parts: StagedPart[];
+}
+
+function targetFor(
+  env: SalesforceSyncEnv,
+  syncConfig: SyncConfig,
+  runId: string,
+  folders: DriveFolders | null,
+): SyncTarget {
+  if (syncConfig.target === "drive") {
+    if (!folders) {
+      throw new Error("drive target requires resolved folder ids");
+    }
+    return createTarget(env, syncConfig, { runId, folders });
+  }
+  return createTarget(env, syncConfig);
 }
 
 export function partName(index: number): string {
@@ -59,7 +76,6 @@ export async function stageResultsPage(
     throw new Error(`unknown object key: ${args.objectKey}`);
   }
 
-  const target = createTarget(env, syncConfig);
   const token = await refreshAccessToken(env);
   const maxBytes = syncConfig.part_max_bytes ?? DEFAULT_PART_MAX_BYTES;
   const drive = syncConfig.target === "drive";
@@ -102,7 +118,7 @@ export async function stageResultsPage(
       }
 
       const uploadStarted = Date.now();
-      const path = await target.putPart(
+      const path = await createTarget(env, syncConfig).putPart(
         args.runId,
         args.objectKey,
         name,
@@ -147,6 +163,7 @@ export async function uploadStagedPart(
     objectKey: string;
     part: StagedPart;
     attempt: number;
+    folders: DriveFolders | null;
   },
 ): Promise<{ path: string; bytes: number; uploadMs: number }> {
   if (!args.part.stagingKey) {
@@ -154,7 +171,7 @@ export async function uploadStagedPart(
   }
 
   const syncConfig = await loadSyncConfig(env);
-  const target = createTarget(env, syncConfig);
+  const target = targetFor(env, syncConfig, args.runId, args.folders);
   const object = await env.R2.get(args.part.stagingKey);
   if (!object) {
     throw new Error(`staged part missing: ${args.part.stagingKey}`);
@@ -189,10 +206,11 @@ export async function commitObject(
     objectKey: string;
     parts: string[];
     recordCount: number;
+    folders: DriveFolders | null;
   },
 ): Promise<void> {
   const syncConfig = await loadSyncConfig(env);
-  const target = createTarget(env, syncConfig);
+  const target = targetFor(env, syncConfig, args.runId, args.folders);
   const keyOrder = syncConfig.objects.map((object) => object.key);
   const prefix = args.parts.length > 0
     ? args.parts[0].slice(0, args.parts[0].lastIndexOf("/") + 1)
@@ -213,14 +231,23 @@ export async function commitObject(
 
   const completed = keyOrder.every((key) => objects[key]);
   if (completed) {
-    await target.putManifest({ generation: args.runId, objects });
-    log({
-      message: "sync completed",
-      generation: args.runId,
-      object_count: keyOrder.length,
-    });
-    await target.cleanupOldGenerations(KEEP_GENERATIONS);
-    await cleanupRuntimeArtifacts(env.R2, KEEP_GENERATIONS);
+    const current = await target.getManifest<{ generation?: string }>();
+    if (shouldPublishManifest(args.runId, current?.generation)) {
+      await target.putManifest({ generation: args.runId, objects });
+      log({
+        message: "sync completed",
+        generation: args.runId,
+        object_count: keyOrder.length,
+      });
+      await target.cleanupOldGenerations(KEEP_GENERATIONS);
+      await cleanupRuntimeArtifacts(env.R2, KEEP_GENERATIONS);
+    } else {
+      log({
+        message: "manifest kept",
+        generation: args.runId,
+        current_generation: current?.generation ?? "",
+      });
+    }
   } else {
     log({
       message: "sync partially completed",

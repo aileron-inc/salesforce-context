@@ -6,9 +6,11 @@ import {
 import { NonRetryableError } from "cloudflare:workflows";
 
 import { loadSyncConfig } from "./config";
-import { MAX_POLLS, MAX_RESULT_PAGES, POLL_INITIAL_MS, POLL_MAX_MS } from "./constants";
+import { bulkPollSleepMs, MAX_POLLS, MAX_RESULT_PAGES } from "./constants";
+import { DriveClient } from "./drive";
+import { resolveDriveFolders } from "./drive-layout";
 import type { SalesforceSyncEnv } from "./env";
-import { HttpStatusError } from "./http";
+import { HttpStatusError, isPermanentHttpError } from "./http";
 import { generationId } from "./ids";
 import { log } from "./log";
 import { commitObject, stageResultsPage, uploadStagedPart } from "./object-sync";
@@ -50,6 +52,36 @@ export class SyncWorkflow extends WorkflowEntrypoint<
       });
       return { ok: true };
     });
+
+    const folders = await step.do(
+      stepLabel("layout", objectKey, "0"),
+      STEP,
+      async () => {
+        try {
+          const syncConfig = await loadSyncConfig(env);
+          if (syncConfig.target !== "drive") {
+            return null;
+          }
+          if (
+            !env.GOOGLE_SERVICE_ACCOUNT_EMAIL ||
+            !env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY ||
+            !syncConfig.drive?.folder_id
+          ) {
+            throw new Error(
+              "drive target requires GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY and sync.config.json drive.folder_id",
+            );
+          }
+          const drive = new DriveClient(
+            env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+            env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
+            syncConfig.drive.folder_id,
+          );
+          return await resolveDriveFolders(env.R2, drive, runId, objectKey);
+        } catch (error) {
+          rethrowStepError(error);
+        }
+      },
+    );
 
     const created = await step.do(
       stepLabel("create-job", objectKey, "0"),
@@ -125,15 +157,21 @@ export class SyncWorkflow extends WorkflowEntrypoint<
           stepLabel("poll-limit", objectKey, String(polls)),
           STEP,
           async () => {
-            throw new NonRetryableError(
-              `Bulk query ${objectKey} did not complete after ${MAX_POLLS} polls`,
-            );
+            log({
+              message: "bulk query still running",
+              generation: runId,
+              object_key: objectKey,
+              polls: MAX_POLLS,
+            });
+            throw bulkQueryStillRunningError(objectKey);
           },
         );
       }
 
-      const waitMs = Math.min(POLL_INITIAL_MS * 2 ** polls, POLL_MAX_MS);
-      await step.sleep(stepLabel("wait", objectKey, String(polls)), waitMs);
+      await step.sleep(
+        stepLabel("wait", objectKey, String(polls)),
+        bulkPollSleepMs(polls),
+      );
       polls += 1;
     }
 
@@ -189,6 +227,7 @@ export class SyncWorkflow extends WorkflowEntrypoint<
                 objectKey,
                 part,
                 attempt: ctx.attempt,
+                folders,
               });
             } catch (error) {
               rethrowStepError(error);
@@ -213,6 +252,7 @@ export class SyncWorkflow extends WorkflowEntrypoint<
           objectKey,
           parts,
           recordCount,
+          folders,
         });
         return { parts: parts.length, recordCount };
       } catch (error) {
@@ -227,11 +267,17 @@ function stepLabel(action: string, objectKey: string, suffix: string): string {
   return `${action}-${safeKey}-${suffix}`;
 }
 
+export function bulkQueryStillRunningError(objectKey: string): Error {
+  return new Error(
+    `Bulk query ${objectKey} still running after ${MAX_POLLS} polls`,
+  );
+}
+
 function rethrowStepError(error: unknown): never {
   if (error instanceof NonRetryableError) {
     throw error;
   }
-  if (error instanceof HttpStatusError && !error.retryable) {
+  if (error instanceof HttpStatusError && isPermanentHttpError(error)) {
     throw new NonRetryableError(error.message);
   }
   if (error instanceof Error && isPermanent(error.message)) {

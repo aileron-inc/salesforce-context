@@ -16,10 +16,15 @@ Cron → Queue → Workflow（オブジェクト単位）
 - Cron は同期本体を実行しない。スロットを Queue `salesforce-context-sync` に入れてすぐ戻る
 - Queue consumer が、その cron の担当オブジェクトごとに Workflow インスタンスを 1 つ起動する
 - Workflow の step は失敗すると指数バックオフで再試行する（初期遅延 30 秒、最大 8 回）。Drive への PUT も 524 / 5xx / 接続断をチャンク単位で再試行する
-- オブジェクトが成功するたびに進捗を記録し、`sync.config.json` の全オブジェクトが揃ったときだけ `manifest.json` を切り替える
+- オブジェクトが成功するたびに進捗を記録し、全オブジェクトが揃い、その世代が現在の manifest より新しいときだけ `manifest.json` を切り替える
 - スケジュールは 1 日 3 回（JST 2:00 / 10:00 / 18:00）。`wrangler.json` の 5 本の cron は変えていない
 - 結果 CSV は加工せず保存する。1 ファイルは最大 8 MiB（`part_max_bytes` で変更可）。Salesforce の 1 ページがそれより大きいときは、引用符内の改行を壊さない境界で `part-0000.csv` 以降に分割し、各ファイルにヘッダ行を繰り返す
 - 読み手はこれまで通り `manifest.json` の `parts` か `{prefix}part-*.csv` を使う。パートが小さくなるだけで、名前と manifest の形は同じ
+- `manifest.json` は、今指している世代より新しい世代が全部揃ったときだけ進む。遅れて終わった古い世代では戻さない
+
+## 実行プラン
+
+Workflow の各 step は Worker の CPU 時間を使う。Free プランの step は CPU 10ms で、100MB 近い結果ページの分割は終わらない。この Worker は **Workers Paid** で動かす。`wrangler.json` の `limits.cpu_ms` は `60000`。約 100MB の CSV 分割はローカルで約 0.6 秒だったので、この値は遅い実行環境とより大きいページ向けの余裕である。
 
 `sync.config.json` の `cron_groups` のキーと `wrangler.json` の `crons` は一致させる。Worker は起動時に R2 の `sync.config.json` を読む。雛形は `sync.config.example.json`。
 
@@ -37,14 +42,18 @@ R2 ターゲットのキーは `generations/{YYYY-MM-DD-HH}/...` とバケット
 
 世代 ID は cron の `scheduledTime` を UTC の時までに切った `YYYY-MM-DD-HH`。同じ時の 5 本の cron は同じ世代を共有する。
 
-同期の途中や、一部オブジェクトの再試行中は `manifest.json` が直前の世代を指したままになる。全オブジェクトの進捗ファイルが揃った Workflow だけが manifest を更新し、直近 6 世代以外を削除する。
+同期の途中や、一部オブジェクトの再試行中は `manifest.json` が直前の世代を指したままになる。全オブジェクトの進捗が揃い、その世代が現在より新しいときだけ manifest を更新し、直近 6 世代以外を削除する。
 
 R2 には公開データとは別に、次の内部キーを書く。読み手は使わない。
 
 ```text
 generations/{YYYY-MM-DD-HH}/_objects/{objectKey}.json   オブジェクトごとの進捗
 staging/{YYYY-MM-DD-HH}/{objectKey}/part-XXXX.csv       Drive アップロード前の一時 CSV
+drive-layout/{YYYY-MM-DD-HH}/...                        Drive の世代フォルダとオブジェクトフォルダの ID
+drive-layout/manifest.json                              Drive 上の manifest.json の file ID
 ```
+
+Drive の世代フォルダとオブジェクトフォルダは、世代の最初に 1 回だけ作り、ID を R2 へ条件付きで書く。先に書いた方が勝ち、遅れた方が作ったフォルダはゴミ箱へ入れる。後続の step はその ID を使い、フォルダを検索し直さない。`_state.json` と `manifest.json` の file ID も同じ方法で 1 つに決める。
 
 ## ログ
 
@@ -64,7 +73,9 @@ bun run test
 
 ## デプロイ前に必要な Cloudflare リソース
 
-`wrangler deploy` は Workflow 定義を作るが、Queue は先に作っておく。
+アカウントは **Workers Paid** にする。Free のままでは Workflow step の CPU 10ms を超えてページ分割が失敗する。
+
+`wrangler deploy` は Workflow 定義を作るが、Queue は先に作っておく。デプロイは **UTC 17時・1時・9時の :03 から :45 のあいだを避ける**。本番 cron がその窓で動く。新しいコードは世代の途中に残っている旧 `_state.json` を読まないので、進行中の世代に載せるとその回の `manifest.json` は進まない。
 
 ```sh
 npx wrangler queues create salesforce-context-sync-dlq

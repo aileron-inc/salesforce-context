@@ -50,6 +50,7 @@ describe("scheduled sync", () => {
       SYNC_QUEUE_NAME,
       SYNC_DLQ_NAME,
     ]);
+    expect(wranglerConfig.limits?.cpu_ms).toBeGreaterThanOrEqual(60_000);
     expect(wranglerConfig.triggers?.crons).toEqual([
       "3 17,1,9 * * *",
       "13 17,1,9 * * *",
@@ -255,12 +256,13 @@ describe("scheduled sync", () => {
       await modifier.disableSleeps();
       await modifier.disableRetryDelays();
     });
-    await runCron(CRONS[0], Date.UTC(2026, 6, 30, 9, 0, 0));
+    await runCron(CRONS[0], Date.UTC(2026, 6, 31, 1, 0, 0));
     await settle(introspector);
 
     const manifest = JSON.parse(
       await (await env.R2.get("manifest.json"))!.text(),
     ) as Manifest;
+    expect(manifest.generation).toBe("2026-07-31-01");
     const parts = manifest.objects[FIRST_OBJECT_KEY].parts;
     expect(parts.length).toBeGreaterThan(1);
     const bodies = await Promise.all(

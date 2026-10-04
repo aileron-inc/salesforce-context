@@ -164,6 +164,219 @@ describe("DriveClient resumable upload", () => {
     ).rejects.toThrow(/Drive upload part-0002\.csv: 400 \{"error":"invalid parent"\}/);
     expect(puts).toBe(1);
   });
+
+  it("403 rate limit はバックオフして再試行し、権限不足の 403 は再試行しない", async () => {
+    (globalThis as { __SF_RETRY_MS?: number }).__SF_RETRY_MS = 0;
+    const rateLimit = JSON.stringify({
+      error: {
+        errors: [{ reason: "userRateLimitExceeded" }],
+        code: 403,
+        message: "Rate Limit Exceeded",
+      },
+    });
+    let dataPuts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        if (url === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "token", expires_in: 3600 });
+        }
+        if (url.startsWith("https://www.googleapis.com/drive/v3/files?")) {
+          return Response.json({ files: [] });
+        }
+        if (url.includes("uploadType=resumable")) {
+          return new Response(null, {
+            status: 200,
+            headers: { Location: "https://upload.example/session" },
+          });
+        }
+        if (url === "https://upload.example/session") {
+          const range = new Headers(init?.headers).get("content-range");
+          if (range === "bytes */4") {
+            return new Response(null, {
+              status: 308,
+              headers: { Range: "bytes=0-0" },
+            });
+          }
+          dataPuts += 1;
+          if (dataPuts === 1) {
+            return new Response(rateLimit, { status: 403 });
+          }
+          return new Response(null, { status: 200 });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    const client = new DriveClient(
+      "sync@example.com",
+      await serviceAccountPem(),
+      "folder-root",
+    );
+    await client.createOrUpdateFile(
+      "part-0003.csv",
+      "parent-1",
+      new Uint8Array([1, 2, 3, 4]),
+      "text/csv",
+    );
+    expect(dataPuts).toBeGreaterThan(1);
+
+    dataPuts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "token", expires_in: 3600 });
+        }
+        if (url.startsWith("https://www.googleapis.com/drive/v3/files?")) {
+          return Response.json({ files: [] });
+        }
+        if (url.includes("uploadType=resumable")) {
+          return new Response(null, {
+            status: 200,
+            headers: { Location: "https://upload.example/denied" },
+          });
+        }
+        if (url === "https://upload.example/denied") {
+          dataPuts += 1;
+          return new Response(
+            JSON.stringify({ error: { errors: [{ reason: "forbidden" }], code: 403 } }),
+            { status: 403 },
+          );
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+    await expect(
+      client.createOrUpdateFile(
+        "part-0004.csv",
+        "parent-1",
+        new Uint8Array([1, 2, 3, 4]),
+        "text/csv",
+      ),
+    ).rejects.toMatchObject({ status: 403, retryable: false });
+    expect(dataPuts).toBe(1);
+  });
+
+  it("アップロードセッションの 404 と 410 は同じセッションを続けない", async () => {
+    (globalThis as { __SF_RETRY_MS?: number }).__SF_RETRY_MS = 0;
+    for (const status of [404, 410]) {
+      let sessions = 0;
+      let resumeQueries = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = input.toString();
+          if (url === "https://oauth2.googleapis.com/token") {
+            return Response.json({ access_token: "token", expires_in: 3600 });
+          }
+          if (url.startsWith("https://www.googleapis.com/drive/v3/files?")) {
+            return Response.json({ files: [] });
+          }
+          if (url.includes("uploadType=resumable")) {
+            sessions += 1;
+            return new Response(null, {
+              status: 200,
+              headers: { Location: `https://upload.example/session-${sessions}` },
+            });
+          }
+          if (url.startsWith("https://upload.example/session-")) {
+            const range = new Headers(init?.headers).get("content-range");
+            if (range?.startsWith("bytes */")) {
+              resumeQueries += 1;
+            }
+            if (sessions === 1) {
+              return new Response("session expired", { status });
+            }
+            return new Response(null, { status: 200 });
+          }
+          throw new Error(`unexpected fetch: ${url}`);
+        }),
+      );
+
+      const client = new DriveClient(
+        "sync@example.com",
+        await serviceAccountPem(),
+        "folder-root",
+      );
+      await expect(
+        client.createOrUpdateFile(
+          "part-0005.csv",
+          "parent-1",
+          new Uint8Array([1, 2, 3, 4]),
+          "text/csv",
+        ),
+      ).rejects.toMatchObject({ status, retryable: true });
+      expect(resumeQueries).toBe(0);
+      await client.createOrUpdateFile(
+        "part-0005.csv",
+        "parent-1",
+        new Uint8Array([1, 2, 3, 4]),
+        "text/csv",
+      );
+      expect(sessions).toBe(2);
+    }
+  });
+
+  it("再開位置はサーバの Range をそのまま使う", async () => {
+    (globalThis as { __SF_RETRY_MS?: number }).__SF_RETRY_MS = 0;
+    const ranges: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        if (url === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "token", expires_in: 3600 });
+        }
+        if (url.startsWith("https://www.googleapis.com/drive/v3/files?")) {
+          return Response.json({ files: [] });
+        }
+        if (url.includes("uploadType=resumable")) {
+          return new Response(null, {
+            status: 200,
+            headers: { Location: "https://upload.example/session" },
+          });
+        }
+        if (url === "https://upload.example/session") {
+          const range = new Headers(init?.headers).get("content-range") ?? "";
+          ranges.push(range);
+          if (range === "bytes */4") {
+            return new Response(null, {
+              status: 308,
+              headers: { Range: "bytes=0-0" },
+            });
+          }
+          if (range === "bytes 0-1/4") {
+            return new Response(null, {
+              status: 308,
+              headers: { Range: "bytes=0-1" },
+            });
+          }
+          if (range === "bytes 2-3/4") {
+            throw new TypeError("Network connection lost.");
+          }
+          return new Response(null, { status: 200 });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    const client = new DriveClient(
+      "sync@example.com",
+      await serviceAccountPem(),
+      "folder-root",
+    );
+    await client.createOrUpdateFile(
+      "part-0006.csv",
+      "parent-1",
+      new Uint8Array([1, 2, 3, 4]),
+      "text/csv",
+      { chunkBytes: 2 },
+    );
+    expect(ranges).toContain("bytes 1-2/4");
+  });
 });
 
 async function serviceAccountPem(): Promise<string> {

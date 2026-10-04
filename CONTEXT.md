@@ -24,9 +24,9 @@ R2 または Google Drive の世代管理された CSV
 
 - 実行基盤は Cloudflare Worker。Cron はスロットを Queue に入れるだけにし、取得と保存はオブジェクトごとの Workflow が行う。
 - 認証は OAuth refresh token フロー。secrets は `SF_CLIENT_ID` / `SF_CLIENT_SECRET` / `SF_REFRESH_TOKEN`、vars は `SF_LOGIN_URL`。Drive ターゲットでは `GOOGLE_SERVICE_ACCOUNT_EMAIL` / `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` も使う。
-- 取得は Bulk API 2.0 query job（結果フォーマットは CSV のみ）。job 作成とポーリングは別 step。ポーリング間隔は 2 秒から最大 30 秒。results は locator + `maxRecords`（省略時 10000）でページ取得する。
+- 取得は Bulk API 2.0 query job（結果フォーマットは CSV のみ）。job 作成とポーリングは別 step。ポーリング間隔は `step.sleep` で 2 秒から最大 30 秒、合計約 60 分まで。それを超えても未完了なら再試行できるエラーにする。results は locator + `maxRecords`（省略時 10000）でページ取得する。結果ボディの読み取りタイムアウトは、ヘッダ取得の再試行とは別である。
 - 結果 CSV の中身は加工しない。保存ファイルは 1 ファイル最大 `part_max_bytes`（省略時 8 MiB）。ページが上限を超えるときは、引用符内改行をレコード境界として `part-XXXX.csv` に分け、各ファイルに元のヘッダを付ける。
-- Drive への保存は resumable upload。チャンクは 2 MiB。524 / 5xx / 接続断はチャンクを再開し、それでも失敗した step は Workflow が指数バックオフ（30 秒起点、8 回）でやり直す。
+- Drive への保存は resumable upload。チャンクは 2 MiB。524 / 5xx / 接続断はチャンクを再開し、それでも失敗した step は Workflow が指数バックオフ（30 秒起点、8 回）でやり直す。Drive の 403（`rateLimitExceeded` / `userRateLimitExceeded`）と 429 もバックオフして再試行する。アップロードセッションの 404 / 410 は、そのセッションを捨てて step の再試行で新しいセッションを開く。恒久エラーは認証設定の不備と 400 に限る。
 - 全件同期のみ。差分同期・削除検出は後回し。
 
 ### 設定駆動（org 非依存）
@@ -42,9 +42,11 @@ R2 または Google Drive の世代管理された CSV
 - 世代 ID は `scheduledTime`（UTC、時まで）から決まり、同じ時の cron は同じ世代を共有する。
 - Workflow はオブジェクトごとに分かれる。片方のアップロード失敗が、もう片方の完了を消さない。
 - 進捗の正は R2 の `generations/{runId}/_objects/{objectKey}.json`。`_state.json` と `manifest.json` はそこから組み立てて保存先に書く。
-- manifest は、設定上の全オブジェクトが進捗に揃ったときだけ切り替える。欠けている間は直前の世代を指したまま。
+- manifest は、設定上の全オブジェクトが進捗に揃い、かつその世代が現在の manifest より新しいときだけ切り替える。欠けている間、または遅れて終わった古い世代では、直前の世代を指したまま。
 - Queue の再配送は Workflow の起動に使う。同じインスタンス ID が既にあれば、完了・実行中は触らず、`errored` / `terminated` だけ `restart()` する。
 - Drive 向け CSV は一度 R2 の `staging/` に置き、パートごとの upload step が Drive へ送る。step の戻り値に CSV 本体は載せない。
+- Drive の世代フォルダとオブジェクトフォルダの ID は R2 の `drive-layout/` に条件付き put で 1 つだけ残す。後続 step は検索し直さない。`_state.json` と `manifest.json` の file ID も同じ。
+- 実行には Workers Paid が必要。`limits.cpu_ms` は 60000。Free の Workflow step（CPU 10ms）では大きいページを分割できない。
 
 ### 保存形式・世代管理
 
@@ -60,7 +62,7 @@ R2 または Google Drive の世代管理された CSV
 - observability 有効。binding 型は `wrangler types` で生成する。
 - fetch ハンドラは 404 のみ返す。外部から同期を起動する経路は公開しない。
 - `sync.config.json` の `cron_groups` のキーと `wrangler.json` の `crons` は必ず一致させる。
-- デプロイ前に Queue `salesforce-context-sync` と DLQ `salesforce-context-sync-dlq` を作る。Workflow は `wrangler deploy` が作る。
+- デプロイ前に Queue `salesforce-context-sync` と DLQ `salesforce-context-sync-dlq` を作る。Workflow は `wrangler deploy` が作る。デプロイは UTC 17時・1時・9時の :03 から :45 を避ける。進行中の世代は旧 `_state.json` を新しいコードが読まない。
 
 ## 非目的
 

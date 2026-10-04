@@ -9,7 +9,8 @@
 - **Worker のコードは org 非依存**。対象オブジェクトの SOQL と cron 割り振りは R2 バケットルートの `sync.config.json` で定義し、step ごとに読み込む。リポジトリには雛形の `sync.config.example.json` のみ置き、実運用の `sync.config.json` は Git に入れない。
 - 1 cron は 1〜2 オブジェクトまで。実処理はオブジェクトごとの Workflow に分け、失敗した step だけを再試行する。
 - `sync.config.json` の `cron_groups` のキーと `wrangler.json` の `crons` は必ず一致させる（不一致の cron は「担当なし」で何もしない）。
-- 世代は `generations/{YYYY-MM-DD-HH}/`（UTC 時まで）に書き、全オブジェクト完了後にだけ `manifest.json` を切り替える。途中失敗時は前の世代の manifest を残す。同期は 1 日 3 回（JST 2/10/18 時）。
+- 世代は `generations/{YYYY-MM-DD-HH}/`（UTC 時まで）に書き、全オブジェクト完了後、かつその世代が現在の manifest より新しいときだけ `manifest.json` を切り替える。途中失敗時も、遅れた古い世代でも、前の世代の manifest を残す。同期は 1 日 3 回（JST 2/10/18 時）。
+- 実行プランは Workers Paid。`limits.cpu_ms` は 60000。Free の Workflow step（CPU 10ms）では大きいページを分割できない。
 - CSV の意味変換（Parquet 化など）を Worker 内でやらない。バイト境界でのパート分割と、保存先へのアップロードだけを Worker が行う。
 - MCP read model、D1、同期結果の通知は作らない。
 - Salesforce への書き戻しはしない。読み取り専用。

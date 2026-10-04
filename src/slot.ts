@@ -1,7 +1,8 @@
 import { NonRetryableError } from "cloudflare:workflows";
 
 import { loadSyncConfig } from "./config";
-import { SYNC_DLQ_NAME } from "./constants";
+import { ENQUEUE_ATTEMPTS, SYNC_DLQ_NAME } from "./constants";
+import { backoffMs } from "./http";
 import type { SalesforceSyncEnv } from "./env";
 import { generationId, workflowInstanceId } from "./ids";
 import { log, safeError } from "./log";
@@ -16,22 +17,37 @@ export async function enqueueSyncSlot(
   env: SalesforceSyncEnv,
   message: SyncSlotMessage,
 ): Promise<void> {
-  try {
-    await env.SYNC_QUEUE.send(message);
-    log({
-      message: "sync queued",
-      cron: message.cron,
-      scheduled_time: message.scheduledTime,
-      generation: generationId(message.scheduledTime),
-    });
-  } catch (error) {
-    log({
-      message: "sync enqueue failed",
-      cron: message.cron,
-      error: safeError(error),
-    });
-    throw error;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= ENQUEUE_ATTEMPTS; attempt += 1) {
+    try {
+      await env.SYNC_QUEUE.send(message);
+      log({
+        message: "sync queued",
+        cron: message.cron,
+        scheduled_time: message.scheduledTime,
+        generation: generationId(message.scheduledTime),
+        attempt,
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      console.error(
+        JSON.stringify({
+          message: "sync enqueue failed",
+          cron: message.cron,
+          scheduled_time: message.scheduledTime,
+          generation: generationId(message.scheduledTime),
+          attempt,
+          attempts: ENQUEUE_ATTEMPTS,
+          error: safeError(error),
+        }),
+      );
+      if (attempt < ENQUEUE_ATTEMPTS) {
+        await scheduler.wait(backoffMs(attempt));
+      }
+    }
   }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 export async function handleSyncBatch(

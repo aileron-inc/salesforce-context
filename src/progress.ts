@@ -86,6 +86,7 @@ export async function cleanupRuntimeArtifacts(
   const ids = new Set<string>();
   await collectChildIds(bucket, "staging/", ids);
   await collectChildIds(bucket, "generations/", ids);
+  await collectChildIds(bucket, "drive-layout/", ids);
 
   const stale = [...ids]
     .sort()
@@ -94,6 +95,7 @@ export async function cleanupRuntimeArtifacts(
   for (const id of stale) {
     await deleteR2Prefix(bucket, `staging/${id}/`);
     await deleteR2Prefix(bucket, `generations/${id}/_objects/`);
+    await deleteR2Prefix(bucket, `drive-layout/${id}/`);
     log({ message: "runtime artifacts deleted", generation: id });
   }
 }

@@ -1,3 +1,18 @@
+const GENERATION_ID = /^\d{4}-\d{2}-\d{2}-\d{2}$/;
+
+export function shouldPublishManifest(
+  candidate: string,
+  current: string | null | undefined,
+): boolean {
+  if (!current || !GENERATION_ID.test(current)) {
+    return true;
+  }
+  if (!GENERATION_ID.test(candidate)) {
+    return false;
+  }
+  return candidate > current;
+}
+
 export function generationId(scheduledTime: number): string {
   return new Date(scheduledTime)
     .toISOString()

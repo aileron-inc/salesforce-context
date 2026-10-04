@@ -3,6 +3,7 @@ import { log } from "./log";
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504, 524]);
 const MAX_ATTEMPTS = 5;
 const SNIPPET_BYTES = 300;
+const RATE_LIMIT_REASON = /rateLimitExceeded|userRateLimitExceeded/;
 
 export class HttpStatusError extends Error {
   readonly status: number;
@@ -18,6 +19,20 @@ export class HttpStatusError extends Error {
 
 export function isRetryableStatus(status: number): boolean {
   return RETRYABLE_STATUSES.has(status);
+}
+
+export function isRateLimitDetail(status: number, detail: string): boolean {
+  if (status === 429) {
+    return true;
+  }
+  return status === 403 && RATE_LIMIT_REASON.test(detail);
+}
+
+export function isPermanentHttpError(error: HttpStatusError): boolean {
+  if (error.retryable) {
+    return false;
+  }
+  return error.status === 400 || error.status === 401 || error.status === 403;
 }
 
 export async function errorSnippet(response: Response): Promise<string> {
@@ -80,13 +95,49 @@ export async function fetchWithRetry(
   input: string,
   init: RequestInit,
   label: string,
+  timeoutMs?: number,
 ): Promise<Response> {
   let lastError: Error | undefined;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    const controller = timeoutMs === undefined ? null : new AbortController();
+    const timer =
+      controller === null ? null : setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(input, init);
-      if (response.ok || !isRetryableStatus(response.status)) {
+      const response = await fetch(input, {
+        ...init,
+        signal: controller?.signal ?? init.signal,
+      });
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (response.ok) {
+        return response;
+      }
+
+      if (response.status === 403) {
+        const detail = await errorSnippet(response.clone());
+        if (isRateLimitDetail(response.status, detail)) {
+          lastError = new HttpStatusError(
+            formatStatus(label, response.status, detail),
+            response.status,
+            true,
+          );
+          log({
+            message: "http retry",
+            label,
+            status: response.status,
+            attempt,
+            detail,
+          });
+          if (attempt < MAX_ATTEMPTS) {
+            await retryWait(attempt);
+          }
+          continue;
+        }
+      }
+
+      if (!isRetryableStatus(response.status)) {
         return response;
       }
 
@@ -104,6 +155,9 @@ export async function fetchWithRetry(
         detail,
       });
     } catch (error) {
+      if (timer) {
+        clearTimeout(timer);
+      }
       lastError = error instanceof Error ? error : new Error(String(error));
       log({
         message: "http retry",
@@ -137,6 +191,6 @@ export async function throwIfNotOk(
   throw new HttpStatusError(
     formatStatus(label, response.status, detail),
     response.status,
-    isRetryableStatus(response.status),
+    isRetryableStatus(response.status) || isRateLimitDetail(response.status, detail),
   );
 }
