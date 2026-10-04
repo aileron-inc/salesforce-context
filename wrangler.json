@@ -27,5 +27,36 @@
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
+  },
+  "workflows": [
+    {
+      "name": "salesforce-context-sync",
+      "binding": "SYNC_WORKFLOW",
+      "class_name": "SyncWorkflow"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "SYNC_QUEUE",
+        "queue": "salesforce-context-sync"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "salesforce-context-sync",
+        "max_batch_size": 1,
+        "max_retries": 10,
+        "retry_delay": 120,
+        "max_concurrency": 5,
+        "dead_letter_queue": "salesforce-context-sync-dlq"
+      },
+      {
+        "queue": "salesforce-context-sync-dlq",
+        "max_batch_size": 1,
+        "max_retries": 1,
+        "max_concurrency": 1
+      }
+    ]
   }
 }

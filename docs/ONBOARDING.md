@@ -5,7 +5,7 @@
 ## 前提
 
 - 対象 org の Salesforce 認証情報（OAuth の client_id / client_secret / refresh_token）が入手できること
-- デプロイ先 Cloudflare アカウントが決まっていること（Free プランで動く）
+- デプロイ先 Cloudflare アカウントが決まっていること
 - `sf` CLI または同等の手段で対象 org にクエリできること
 
 ## 手順
@@ -61,14 +61,31 @@ wrangler secret put SF_CLIENT_SECRET
 wrangler secret put SF_REFRESH_TOKEN
 ```
 
-### 6. デプロイして初回同期を検証する
+`sync.config.json` の `target` が `drive` のときは、加えて次を設定する。
 
-`wrangler.json` の `bucket_name` と `crons` をデプロイ先に合わせて `wrangler deploy`。
+```sh
+wrangler secret put GOOGLE_SERVICE_ACCOUNT_EMAIL
+wrangler secret put GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
+```
+
+`drive.folder_id` は `sync.config.json` に書く。サービスアカウントがそのフォルダを編集できること。
+
+### 6. Queue を作ってからデプロイする
+
+Workflow `salesforce-context-sync` は `wrangler deploy` が作成する。Queue は先に作る。
+
+```sh
+npx wrangler queues create salesforce-context-sync-dlq
+npx wrangler queues create salesforce-context-sync
+```
+
+`wrangler.json` の `bucket_name` と `crons` をデプロイ先に合わせ、`npx wrangler deploy`。
 
 検証方法: 一時的に cron を数分後にずらしてデプロイ → `wrangler tail` で観測 → 完了したら本番 cron に戻して再デプロイ。成功の確認は:
 
 - tail に `sync completed` が出る
-- R2 の `manifest.json` に全オブジェクトが載る
+- 保存先の `manifest.json` に全オブジェクトが載る
+- 途中の `Drive upload failed: 524` のあと `part stored` と `bulk_wait_ms` / `download_ms` / `upload_ms` が出る
 
 ### 7. 運用ドキュメントを生成して R2 に置く
 

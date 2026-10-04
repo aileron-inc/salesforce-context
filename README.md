@@ -1,35 +1,58 @@
 # salesforce-context
 
-Salesforce の業務データを Cloudflare R2 の CSV として同期する、Cloudflare Workers 製の同期基盤。
+Salesforce の業務データを、Cloudflare Workers から Bulk API 2.0 で取得し、世代管理された CSV として R2 または Google Drive に置く同期基盤。
 
 ```text
-Salesforce → Bulk API 2.0 → R2 (CSV, 世代管理) → ローカル DuckDB などで読む
+Cron → Queue → Workflow（オブジェクト単位）
+                 ├─ Salesforce Bulk API 2.0
+                 └─ R2 または Google Drive（CSV, 世代管理）
+                      → ローカル DuckDB などで読む
 ```
 
 読み取り側（DuckDB のビュー定義など）はこのリポジトリの範囲外。
 
 ## 構成
 
-- Cloudflare Worker の Cron Trigger（Free プランで動作）
-- Free プランの制約に収めるため、5本の Cron に処理を分割し、1回の起動で1〜2オブジェクトを同期する
-  - 1日3回（JST 2:00 / 10:00 / 18:00 開始）。各ブロック内の5本は `sync.config.json` の `cron_groups` でずらして実行する
-- OAuth refresh token でアクセストークンを取得
-- Bulk API 2.0 query job で `sync.config.json` に設定されたオブジェクトを SOQL 全件取得（ポーリングは指数バックオフ）
-- 結果 CSV は加工せず、1ページ（最大10,000レコード）= 1ファイルとして R2 に保存
-- 全オブジェクト完了後に `manifest.json` を切り替え
+- Cron は同期本体を実行しない。スロットを Queue `salesforce-context-sync` に入れてすぐ戻る
+- Queue consumer が、その cron の担当オブジェクトごとに Workflow インスタンスを 1 つ起動する
+- Workflow の step は失敗すると指数バックオフで再試行する（初期遅延 30 秒、最大 8 回）。Drive への PUT も 524 / 5xx / 接続断をチャンク単位で再試行する
+- オブジェクトが成功するたびに進捗を記録し、`sync.config.json` の全オブジェクトが揃ったときだけ `manifest.json` を切り替える
+- スケジュールは 1 日 3 回（JST 2:00 / 10:00 / 18:00）。`wrangler.json` の 5 本の cron は変えていない
+- 結果 CSV は加工せず保存する。1 ファイルは最大 8 MiB（`part_max_bytes` で変更可）。Salesforce の 1 ページがそれより大きいときは、引用符内の改行を壊さない境界で `part-0000.csv` 以降に分割し、各ファイルにヘッダ行を繰り返す
+- 読み手はこれまで通り `manifest.json` の `parts` か `{prefix}part-*.csv` を使う。パートが小さくなるだけで、名前と manifest の形は同じ
 
-Worker は起動時に R2 バケットルートの `sync.config.json` を読み込む（コードは org 非依存）。雛形は `sync.config.example.json` を参照。実運用の `sync.config.json` は Git に入れず、R2 に配置する。
-`sync.config.json` の `cron_groups` のキーと `wrangler.json` の `crons` は一致させること。
+`sync.config.json` の `cron_groups` のキーと `wrangler.json` の `crons` は一致させる。Worker は起動時に R2 の `sync.config.json` を読む。雛形は `sync.config.example.json`。
 
-## R2 レイアウト
+## レイアウト
+
+公開する契約（R2 ターゲットでも Drive ターゲットでも同じ意味）:
 
 ```text
-manifest.json                       現在の世代へのポインタ
-generations/{YYYY-MM-DD-HH}/_state.json
-generations/{YYYY-MM-DD-HH}/{objectKey}/part-0000.csv ...
+manifest.json
+{generation}/_state.json
+{generation}/{objectKey}/part-0000.csv ...
 ```
 
-同期が途中で失敗した場合、`manifest.json` は直前の世代を指し続ける。
+R2 ターゲットのキーは `generations/{YYYY-MM-DD-HH}/...` とバケットルートの `manifest.json`。Drive ターゲットはルートフォルダ直下に `manifest.json` と `{YYYY-MM-DD-HH}/` フォルダを作る。
+
+世代 ID は cron の `scheduledTime` を UTC の時までに切った `YYYY-MM-DD-HH`。同じ時の 5 本の cron は同じ世代を共有する。
+
+同期の途中や、一部オブジェクトの再試行中は `manifest.json` が直前の世代を指したままになる。全オブジェクトの進捗ファイルが揃った Workflow だけが manifest を更新し、直近 6 世代以外を削除する。
+
+R2 には公開データとは別に、次の内部キーを書く。読み手は使わない。
+
+```text
+generations/{YYYY-MM-DD-HH}/_objects/{objectKey}.json   オブジェクトごとの進捗
+staging/{YYYY-MM-DD-HH}/{objectKey}/part-XXXX.csv       Drive アップロード前の一時 CSV
+```
+
+## ログ
+
+構造化 JSON。秘密値とレコード本文は出さない。失敗した HTTP 応答はステータスと本文の先頭だけを残す。
+
+- `bulk query ready` … `bulk_wait_ms`（Bulk ジョブ完了までの待ち）
+- `page downloaded` … `download_ms`, `download_bytes`
+- `part stored` … `bytes`, `upload_ms`（保存先へのアップロード）
 
 ## ローカル準備
 
@@ -39,32 +62,50 @@ bun run check
 bun run test
 ```
 
-## シークレット
+## デプロイ前に必要な Cloudflare リソース
 
-次の値を `.dev.vars`（ローカル）と `wrangler secret put`（本番）で設定する。Git には入れない。
+`wrangler deploy` は Workflow 定義を作るが、Queue は先に作っておく。
+
+```sh
+npx wrangler queues create salesforce-context-sync-dlq
+npx wrangler queues create salesforce-context-sync
+npx wrangler deploy
+```
+
+| リソース | 名前 | 作り方 |
+|---|---|---|
+| Queue | `salesforce-context-sync` | 上の `queues create`。consumer は max_retries 10、retry_delay 120 秒 |
+| Queue（DLQ） | `salesforce-context-sync-dlq` | 先に作る。Workflow を起動できなかったスロットが入る |
+| Workflow | `salesforce-context-sync` | `wrangler deploy` が binding `SYNC_WORKFLOW` / class `SyncWorkflow` から作成する |
+| R2 | `salesforce-context` | 既存バケット。設定変更は不要。`sync.config.json` はそのまま読める |
+| シークレット | 下記 | 既存の値を維持する。今回の変更で増やすものはない |
+
+シークレット（`.dev.vars` と `wrangler secret put`。Git に入れない）:
 
 - `SF_CLIENT_ID`
 - `SF_CLIENT_SECRET`
 - `SF_REFRESH_TOKEN`
+- Drive ターゲットのとき `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+- Drive ターゲットのとき `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`
+
+`SF_LOGIN_URL` は `wrangler.json` の var。任意の `sync.config.json` 項目 `part_max_bytes`（正の整数、省略時 8388608）でパート上限を変えられる。
 
 ## 手動実行
 
-ローカルで scheduled イベントを試す:
-
 ```sh
 bun run dev -- --test-scheduled
-curl "http://localhost:8787/__scheduled?cron=0+17+*+*+*"
+curl "http://localhost:8787/__scheduled?cron=3+17,1,9+*+*+*"
 ```
 
-（cron 文字列は `sync.config.json` の `cron_groups` のキーのどれかを指定する）
+ローカルでは Queue consumer と Workflow が続く。cron 文字列は `sync.config.json` の `cron_groups` のキーにする。
 
 ## 新しい org へのセットアップ
 
-`docs/ONBOARDING.md`（AI エージェント向け手順書）を参照。
+`docs/ONBOARDING.md` を参照。
 
 ## セキュリティ
 
 - `.dev.vars` を commit しない。
 - 旧 `copy_to_drive` の鍵・token・実データを Git に入れない。
-- レコード本文や token をログへ出さない。
+- レコード本文や token をログへ出さない。失敗応答の本文は先頭 300 文字だけ。
 - Worker の fetch は 404 のみを返し、外部から同期を起動する経路は公開しない。
