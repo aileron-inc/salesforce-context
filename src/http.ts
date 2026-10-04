@@ -46,10 +46,24 @@ export function isPermanentDrive403(body: string): boolean {
   }
 
   const reasons = collectDriveReasons(parsed);
+  if (reasons.some((reason) => isRateLimitReason(reason))) {
+    return false;
+  }
   if (reasons.some((reason) => PERMANENT_DRIVE_REASONS.has(normalizeDriveReason(reason)))) {
     return true;
   }
+  if (reasons.length > 0) {
+    return false;
+  }
   return driveErrorStatus(parsed) === "permissiondenied";
+}
+
+function isRateLimitReason(reason: string): boolean {
+  const normalized = normalizeDriveReason(reason);
+  if (normalized.includes("storage")) {
+    return false;
+  }
+  return normalized.endsWith("ratelimitexceeded") || normalized.endsWith("quotaexceeded");
 }
 
 export function isRetryableHttpBody(status: number, body: string): boolean {

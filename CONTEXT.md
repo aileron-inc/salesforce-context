@@ -26,7 +26,7 @@ R2 または Google Drive の世代管理された CSV
 - 認証は OAuth refresh token フロー。secrets は `SF_CLIENT_ID` / `SF_CLIENT_SECRET` / `SF_REFRESH_TOKEN`、vars は `SF_LOGIN_URL`。Drive ターゲットでは `GOOGLE_SERVICE_ACCOUNT_EMAIL` / `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` も使う。
 - 取得は Bulk API 2.0 query job（結果フォーマットは CSV のみ）。job 作成とポーリングは別 step。ポーリング間隔は `step.sleep` で 2 秒から最大 30 秒、合計約 60 分まで。それを超えたら `NonRetryableError` で打ち切り、ポーリングしない step 再試行はしない。results は locator + `maxRecords`（省略時 10000）でページ取得する。結果ボディの読み取りタイムアウトは、ヘッダ取得の再試行とは別である。
 - 結果 CSV の中身は加工しない。保存ファイルは 1 ファイル最大 `part_max_bytes`（省略時 8 MiB）。ページが上限を超えるときは、引用符内改行をレコード境界として `part-XXXX.csv` に分け、各ファイルに元のヘッダを付ける。
-- Drive への保存は resumable upload。チャンクは 2 MiB。524 / 5xx / 接続断はチャンクを再開し、それでも失敗した step は Workflow が指数バックオフ（30 秒起点、8 回）でやり直す。Drive の 403 は、数 KB の JSON から理由を大文字小文字を無視して読み、権限不足・容量超過・domainPolicy・forbidden・notFound などの恒久理由だけ再試行しない。それ以外（`userRateLimitExceeded` や `RATE_LIMIT_EXCEEDED` を含む）はバックオフして再試行する。ログに残す本文は先頭 300 文字だけ。アップロードセッションの 404 / 410 は、そのセッションを捨てて step の再試行で新しいセッションを開く。保存済みの Drive file / folder ID が 404 またはゴミ箱なら、R2 の ID を条件付きで消して作り直す。
+- Drive への保存は resumable upload。チャンクは 2 MiB。524 / 5xx / 接続断はチャンクを再開し、それでも失敗した step は Workflow が指数バックオフ（30 秒起点、8 回）でやり直す。Drive の 403 は、数 KB の JSON から理由を大文字小文字を無視して読む。`rateLimitExceeded` / `RATE_LIMIT_EXCEEDED` / `quotaExceeded` があれば、`status` が `PERMISSION_DENIED` でも再試行する。`status` は理由が無いときだけ見る。権限不足・容量超過・domainPolicy・forbidden・notFound などの恒久理由だけ再試行しない。ログに残す本文は先頭 300 文字だけ。アップロードセッションの 404 / 410 は、そのセッションを捨てて step の再試行で新しいセッションを開く。保存済みの Drive file / folder ID が 404 またはゴミ箱なら、R2 の ID を条件付きで消して作り直す。
 - 全件同期のみ。差分同期・削除検出は後回し。
 
 ### 設定駆動（org 非依存）

@@ -53,6 +53,36 @@ export function longRpcRateLimitBody(): string {
   });
 }
 
+export function permissionDeniedRateLimitBody(options?: { details?: boolean }): string {
+  const message = QUOTA_MESSAGE.repeat(2);
+  const error: Record<string, unknown> = {
+    code: 403,
+    message,
+    status: "PERMISSION_DENIED",
+    errors: [
+      {
+        domain: "usageLimits",
+        message,
+        reason: "rateLimitExceeded",
+      },
+    ],
+  };
+  if (options?.details) {
+    error.details = [
+      {
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        reason: "rateLimitExceeded",
+        domain: "googleapis.com",
+        metadata: {
+          quota_limit: "defaultPerMinutePerProject",
+          service: "drive.googleapis.com",
+        },
+      },
+    ];
+  }
+  return JSON.stringify({ error });
+}
+
 export function longErrorsReasonBody(reason: string): string {
   const message = "x".repeat(500);
   return JSON.stringify({

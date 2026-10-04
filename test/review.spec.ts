@@ -24,6 +24,7 @@ import {
   longRpcRateLimitBody,
   longRpcReasonBody,
   longUserRateLimitBody,
+  permissionDeniedRateLimitBody,
 } from "./google-drive-errors";
 
 const CONFIG = syncConfig as SyncConfig;
@@ -149,6 +150,31 @@ describe("review fixes", () => {
     expect(rpcDenied.indexOf("INSUFFICIENT_PERMISSIONS")).toBeGreaterThan(300);
     expect(isPermanentDrive403(rpcDenied)).toBe(true);
     expect(isPermanentDrive403(longRpcReasonBody("notFound"))).toBe(true);
+    const rateWithStatus = permissionDeniedRateLimitBody();
+    const rateWithDetails = permissionDeniedRateLimitBody({ details: true });
+    expect(rateWithStatus).not.toContain('"details"');
+    expect(rateWithDetails).toContain("google.rpc.ErrorInfo");
+    expect(isPermanentDrive403(rateWithStatus)).toBe(false);
+    expect(isPermanentDrive403(rateWithDetails)).toBe(false);
+    expect(isPermanentDrive403(longErrorsReasonBody("quotaExceeded"))).toBe(false);
+    expect(
+      isPermanentDrive403(
+        JSON.stringify({
+          error: {
+            code: 403,
+            status: "PERMISSION_DENIED",
+            errors: [{ reason: "rate_limit_exceeded" }],
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isPermanentDrive403(
+        JSON.stringify({
+          error: { code: 403, message: "denied", status: "PERMISSION_DENIED" },
+        }),
+      ),
+    ).toBe(true);
     expect(shortenDetail(userRate).length).toBeLessThanOrEqual(300);
 
     (globalThis as { __SF_RETRY_MS?: number }).__SF_RETRY_MS = 0;
