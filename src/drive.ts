@@ -4,8 +4,9 @@ import {
   fetchWithRetry,
   formatStatus,
   HttpStatusError,
-  isRateLimitDetail,
-  isRetryableStatus,
+  isRetryableHttpBody,
+  readErrorBody,
+  shortenDetail,
   throwIfNotOk,
 } from "./http";
 import { log } from "./log";
@@ -178,6 +179,21 @@ export class DriveClient {
     await throwIfNotOk(response, "Drive trash failed");
   }
 
+  async fileStatus(fileId: string): Promise<"live" | "missing"> {
+    const response = await this.authedFetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,trashed`,
+      {},
+      "Drive file",
+    );
+    if (response.status === 404) {
+      await errorSnippet(response);
+      return "missing";
+    }
+    await throwIfNotOk(response, "Drive file failed");
+    const data = (await response.json()) as { trashed?: boolean };
+    return data.trashed ? "missing" : "live";
+  }
+
   async downloadJson<T>(fileId: string): Promise<T | null> {
     const response = await this.authedFetch(
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,
@@ -294,14 +310,13 @@ export class DriveClient {
     );
 
     if (!response.ok && response.status !== 308) {
-      const detail = await errorSnippet(response);
+      const body = await readErrorBody(response);
+      const detail = shortenDetail(body);
       const deadSession = response.status === 404 || response.status === 410;
       throw new HttpStatusError(
         formatStatus(`Drive upload session ${name}`, response.status, detail),
         response.status,
-        deadSession ||
-          isRetryableStatus(response.status) ||
-          isRateLimitDetail(response.status, detail),
+        deadSession || isRetryableHttpBody(response.status, body),
       );
     }
 
@@ -470,12 +485,10 @@ export class DriveClient {
       return next ?? offset;
     }
 
-    const detail = await errorSnippet(response);
+    const body = await readErrorBody(response);
+    const detail = shortenDetail(body);
     const deadSession = response.status === 404 || response.status === 410;
-    const retryable =
-      deadSession ||
-      isRetryableStatus(response.status) ||
-      isRateLimitDetail(response.status, detail);
+    const retryable = deadSession || isRetryableHttpBody(response.status, body);
     log({
       message: "drive upload failed",
       label,
@@ -523,14 +536,13 @@ export class DriveClient {
       return next ?? 0;
     }
 
-    const detail = await errorSnippet(response);
+    const body = await readErrorBody(response);
+    const detail = shortenDetail(body);
     const deadSession = response.status === 404 || response.status === 410;
     throw new HttpStatusError(
       formatStatus(`${label} resume`, response.status, detail),
       response.status,
-      deadSession ||
-        isRetryableStatus(response.status) ||
-        isRateLimitDetail(response.status, detail),
+      deadSession || isRetryableHttpBody(response.status, body),
     );
   }
 

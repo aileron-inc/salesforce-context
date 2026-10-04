@@ -15,7 +15,7 @@ Cron → Queue → Workflow（オブジェクト単位）
 
 - Cron は同期本体を実行しない。スロットを Queue `salesforce-context-sync` に入れてすぐ戻る
 - Queue consumer が、その cron の担当オブジェクトごとに Workflow インスタンスを 1 つ起動する
-- Workflow の step は失敗すると指数バックオフで再試行する（初期遅延 30 秒、最大 8 回）。Drive への PUT も 524 / 5xx / 接続断をチャンク単位で再試行する
+- Workflow の step は失敗すると指数バックオフで再試行する（初期遅延 30 秒、最大 8 回）。Drive への PUT も 524 / 5xx / 接続断と、権限不足以外の 403 を再試行する
 - オブジェクトが成功するたびに進捗を記録し、全オブジェクトが揃い、その世代が現在の manifest より新しいときだけ `manifest.json` を切り替える
 - スケジュールは 1 日 3 回（JST 2:00 / 10:00 / 18:00）。`wrangler.json` の 5 本の cron は変えていない
 - 結果 CSV は加工せず保存する。1 ファイルは最大 8 MiB（`part_max_bytes` で変更可）。Salesforce の 1 ページがそれより大きいときは、引用符内の改行を壊さない境界で `part-0000.csv` 以降に分割し、各ファイルにヘッダ行を繰り返す

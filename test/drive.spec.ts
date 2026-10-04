@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DriveClient } from "../src/drive";
+import {
+  longErrorsReasonBody,
+  longRpcRateLimitBody,
+  longUserRateLimitBody,
+} from "./google-drive-errors";
 
 describe("DriveClient resumable upload", () => {
   afterEach(() => {
@@ -376,6 +381,118 @@ describe("DriveClient resumable upload", () => {
       { chunkBytes: 2 },
     );
     expect(ranges).toContain("bytes 1-2/4");
+  });
+
+  it("長い Google 403 は理由が後ろにあってもレート制限だけ再試行する", async () => {
+    (globalThis as { __SF_RETRY_MS?: number }).__SF_RETRY_MS = 0;
+    const bodies = [longUserRateLimitBody(), longRpcRateLimitBody()];
+    for (const rateLimitBody of bodies) {
+      expect(rateLimitBody.search(/userRateLimitExceeded|RATE_LIMIT_EXCEEDED/)).toBeGreaterThan(
+        300,
+      );
+      const logs: string[] = [];
+      vi.spyOn(console, "log").mockImplementation((message?: unknown) => {
+        logs.push(String(message));
+      });
+      let dataPuts = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = input.toString();
+          if (url === "https://oauth2.googleapis.com/token") {
+            return Response.json({ access_token: "token", expires_in: 3600 });
+          }
+          if (url.startsWith("https://www.googleapis.com/drive/v3/files?")) {
+            return Response.json({ files: [] });
+          }
+          if (url.includes("uploadType=resumable")) {
+            return new Response(null, {
+              status: 200,
+              headers: { Location: "https://upload.example/session" },
+            });
+          }
+          if (url === "https://upload.example/session") {
+            const range = new Headers(init?.headers).get("content-range");
+            if (range?.startsWith("bytes */")) {
+              return new Response(null, {
+                status: 308,
+                headers: { Range: "bytes=0-0" },
+              });
+            }
+            dataPuts += 1;
+            if (dataPuts === 1) {
+              return new Response(rateLimitBody, { status: 403 });
+            }
+            return new Response(null, { status: 200 });
+          }
+          throw new Error(`unexpected fetch: ${url}`);
+        }),
+      );
+
+      const client = new DriveClient(
+        "sync@example.com",
+        await serviceAccountPem(),
+        "folder-root",
+      );
+      await client.createOrUpdateFile(
+        "part-0007.csv",
+        "parent-1",
+        new Uint8Array([1, 2, 3, 4]),
+        "text/csv",
+      );
+      expect(dataPuts).toBeGreaterThan(1);
+      const failed = logs
+        .map((line) => JSON.parse(line) as { message?: string; detail?: string })
+        .filter((line) => line.message === "drive upload failed");
+      expect(failed.length).toBeGreaterThan(0);
+      expect(failed.every((line) => (line.detail?.length ?? 0) <= 300)).toBe(true);
+      expect(failed.some((line) => (line.detail?.length ?? 0) === rateLimitBody.length)).toBe(
+        false,
+      );
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+    }
+
+    const denied = longErrorsReasonBody("insufficientPermissions");
+    expect(denied.indexOf("insufficientPermissions")).toBeGreaterThan(300);
+    let deniedPuts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "token", expires_in: 3600 });
+        }
+        if (url.startsWith("https://www.googleapis.com/drive/v3/files?")) {
+          return Response.json({ files: [] });
+        }
+        if (url.includes("uploadType=resumable")) {
+          return new Response(null, {
+            status: 200,
+            headers: { Location: "https://upload.example/denied" },
+          });
+        }
+        if (url === "https://upload.example/denied") {
+          deniedPuts += 1;
+          return new Response(denied, { status: 403 });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+    const client = new DriveClient(
+      "sync@example.com",
+      await serviceAccountPem(),
+      "folder-root",
+    );
+    await expect(
+      client.createOrUpdateFile(
+        "part-0008.csv",
+        "parent-1",
+        new Uint8Array([1, 2, 3, 4]),
+        "text/csv",
+      ),
+    ).rejects.toMatchObject({ status: 403, retryable: false });
+    expect(deniedPuts).toBe(1);
   });
 });
 

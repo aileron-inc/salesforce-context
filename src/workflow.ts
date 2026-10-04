@@ -153,19 +153,13 @@ export class SyncWorkflow extends WorkflowEntrypoint<
       }
 
       if (polls >= MAX_POLLS) {
-        await step.do(
-          stepLabel("poll-limit", objectKey, String(polls)),
-          STEP,
-          async () => {
-            log({
-              message: "bulk query still running",
-              generation: runId,
-              object_key: objectKey,
-              polls: MAX_POLLS,
-            });
-            throw bulkQueryStillRunningError(objectKey);
-          },
-        );
+        log({
+          message: "bulk query still running",
+          generation: runId,
+          object_key: objectKey,
+          polls: MAX_POLLS,
+        });
+        throw bulkQueryStillRunningError(objectKey);
       }
 
       await step.sleep(
@@ -267,8 +261,8 @@ function stepLabel(action: string, objectKey: string, suffix: string): string {
   return `${action}-${safeKey}-${suffix}`;
 }
 
-export function bulkQueryStillRunningError(objectKey: string): Error {
-  return new Error(
+export function bulkQueryStillRunningError(objectKey: string): NonRetryableError {
+  return new NonRetryableError(
     `Bulk query ${objectKey} still running after ${MAX_POLLS} polls`,
   );
 }

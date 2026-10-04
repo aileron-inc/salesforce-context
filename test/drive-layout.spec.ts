@@ -40,6 +40,9 @@ describe("Drive layout ids", () => {
       async trash(fileId: string): Promise<void> {
         trashed.push(fileId);
       },
+      async fileStatus(): Promise<"live" | "missing"> {
+        return "live";
+      },
     };
     const key = `drive-layout/spec-folder-${crypto.randomUUID()}/generation.json`;
     const [first, second] = await Promise.all([
@@ -78,6 +81,10 @@ describe("Drive layout ids", () => {
         }
         if (url === "https://oauth2.googleapis.com/token") {
           return Response.json({ access_token: "token", expires_in: 3600 });
+        }
+        if (url.includes("fields=id,trashed") || url.includes("fields=id%2Ctrashed")) {
+          const id = decodeURIComponent(url.split("/files/")[1]?.split("?")[0] ?? "");
+          return Response.json({ id, trashed: false });
         }
         if (url.includes("/drive/v3/files?") && (!init?.method || init.method === "GET")) {
           lists += 1;
@@ -165,6 +172,9 @@ describe("Drive layout ids", () => {
       async trash(fileId: string): Promise<void> {
         trashed.push(fileId);
       },
+      async fileStatus(): Promise<"live" | "missing"> {
+        return "live";
+      },
     };
     const key = `drive-layout/spec-file-${crypto.randomUUID()}.json`;
     const [first, second] = await Promise.all([
@@ -174,6 +184,58 @@ describe("Drive layout ids", () => {
     expect(first).toBe(second);
     expect(trashed).toHaveLength(1);
     expect(trashed[0]).not.toBe(first);
+  });
+
+  it("404 やゴミ箱の保存済み ID は条件付きで捨てて作り直す", async () => {
+    const key = `drive-layout/spec-stale-${crypto.randomUUID()}.json`;
+    await env.R2.put(key, JSON.stringify({ id: "dead-folder" }));
+    let created = 0;
+    const drive = {
+      async findFolder(): Promise<string | null> {
+        return null;
+      },
+      async createFolder(): Promise<string> {
+        created += 1;
+        return `folder-${created}`;
+      },
+      async trash(): Promise<void> {},
+      async fileStatus(fileId: string): Promise<"live" | "missing"> {
+        return fileId === "dead-folder" ? "missing" : "live";
+      },
+    };
+    const resolved = await resolveFolderId(env.R2, drive, key, "2026-07-30-17", "root");
+    expect(resolved).toBe("folder-1");
+    expect(await readStoredId(env.R2, key)).toBe("folder-1");
+    const again = await resolveFolderId(env.R2, drive, key, "2026-07-30-17", "root");
+    expect(again).toBe("folder-1");
+    expect(created).toBe(1);
+
+    const fileKey = `drive-layout/spec-trashed-${crypto.randomUUID()}.json`;
+    await env.R2.put(fileKey, JSON.stringify({ id: "trashed-file" }));
+    let files = 0;
+    const fileDrive = {
+      async findFileId(): Promise<string | null> {
+        return null;
+      },
+      async createEmptyFile(): Promise<string> {
+        files += 1;
+        return `file-${files}`;
+      },
+      async trash(): Promise<void> {},
+      async fileStatus(fileId: string): Promise<"live" | "missing"> {
+        return fileId === "trashed-file" ? "missing" : "live";
+      },
+    };
+    const fileId = await resolveFileId(
+      env.R2,
+      fileDrive,
+      fileKey,
+      "_state.json",
+      "parent",
+      "application/json",
+    );
+    expect(fileId).toBe("file-1");
+    expect(await readStoredId(env.R2, fileKey)).toBe("file-1");
   });
 });
 

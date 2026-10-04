@@ -7,7 +7,9 @@ import { bulkWaitBudgetMs } from "../src/constants";
 import {
   fetchWithRetry,
   HttpStatusError,
+  isPermanentDrive403,
   isPermanentHttpError,
+  shortenDetail,
 } from "../src/http";
 import { shouldPublishManifest } from "../src/ids";
 import { commitObject } from "../src/object-sync";
@@ -17,6 +19,12 @@ import { enqueueSyncSlot } from "../src/slot";
 import type { SalesforceSyncEnv } from "../src/env";
 import { bulkQueryStillRunningError } from "../src/workflow";
 import syncConfig from "./fixtures/sync.config.json";
+import {
+  longErrorsReasonBody,
+  longRpcRateLimitBody,
+  longRpcReasonBody,
+  longUserRateLimitBody,
+} from "./google-drive-errors";
 
 const CONFIG = syncConfig as SyncConfig;
 
@@ -106,11 +114,10 @@ describe("review fixes", () => {
     expect(manifest.generation).toBe(runId);
   });
 
-  it("Bulk の待ちは約 60 分で、打ち切りは再試行できる", () => {
+  it("Bulk の待ちは約 60 分で、打ち切りはポーリングしない再試行をしない", () => {
     expect(bulkWaitBudgetMs()).toBeGreaterThanOrEqual(60 * 60 * 1000);
     const error = bulkQueryStillRunningError("accounts");
-    expect(error).toBeInstanceOf(Error);
-    expect(error).not.toBeInstanceOf(NonRetryableError);
+    expect(error).toBeInstanceOf(NonRetryableError);
     expect(isPermanentHttpError(new HttpStatusError("bad request", 400, false))).toBe(true);
     expect(
       isPermanentHttpError(
@@ -121,6 +128,53 @@ describe("review fixes", () => {
       false,
     );
     expect(isPermanentHttpError(new HttpStatusError("missing", 404, false))).toBe(false);
+  });
+
+  it("長い Google 403 は理由が 300 バイトより後ろでも判定する", async () => {
+    const userRate = longUserRateLimitBody();
+    const rpcRate = longRpcRateLimitBody();
+    const denied = longErrorsReasonBody("insufficientPermissions");
+    const storage = longErrorsReasonBody("storageQuotaExceeded");
+    const policy = longErrorsReasonBody("domainPolicy");
+    for (const body of [userRate, rpcRate, denied, storage, policy]) {
+      expect(body.length).toBeGreaterThan(300);
+      expect(body.search(/reason/i)).toBeGreaterThan(300);
+    }
+    expect(isPermanentDrive403(userRate)).toBe(false);
+    expect(isPermanentDrive403(rpcRate)).toBe(false);
+    expect(isPermanentDrive403(denied)).toBe(true);
+    expect(isPermanentDrive403(storage)).toBe(true);
+    expect(isPermanentDrive403(policy)).toBe(true);
+    const rpcDenied = longRpcReasonBody("INSUFFICIENT_PERMISSIONS");
+    expect(rpcDenied.indexOf("INSUFFICIENT_PERMISSIONS")).toBeGreaterThan(300);
+    expect(isPermanentDrive403(rpcDenied)).toBe(true);
+    expect(isPermanentDrive403(longRpcReasonBody("notFound"))).toBe(true);
+    expect(shortenDetail(userRate).length).toBeLessThanOrEqual(300);
+
+    (globalThis as { __SF_RETRY_MS?: number }).__SF_RETRY_MS = 0;
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((message?: unknown) => {
+      logs.push(String(message));
+    });
+    let attempt = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return new Response(userRate, { status: 403 });
+        }
+        return new Response("ok");
+      }),
+    );
+    const response = await fetchWithRetry("https://example.test/drive", {}, "Drive list");
+    expect(await response.text()).toBe("ok");
+    expect(attempt).toBe(2);
+    const retry = logs.map((line) => JSON.parse(line) as { detail?: string });
+    expect(retry.some((line) => (line.detail?.length ?? 0) <= 300 && (line.detail?.length ?? 0) > 0)).toBe(
+      true,
+    );
+    expect(logs.join("\n")).not.toContain("userRateLimitExceeded");
   });
 
   it("Salesforce のヘッダタイムアウトは試行ごとに作り直す", async () => {
