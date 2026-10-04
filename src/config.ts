@@ -12,6 +12,8 @@ export interface SyncConfig {
   drive?: {
     folder_id: string;
   };
+  /** 保存する CSV 1ファイルの上限バイト。省略時は 8 MiB。 */
+  part_max_bytes?: number;
 }
 
 export const SYNC_CONFIG_KEY = "sync.config.json";
@@ -41,6 +43,13 @@ function validateSyncConfig(config: SyncConfig): void {
         `${SYNC_CONFIG_KEY}: each object requires key, label and soql`,
       );
     }
+  }
+
+  if (
+    config.part_max_bytes !== undefined &&
+    (!Number.isInteger(config.part_max_bytes) || config.part_max_bytes < 1)
+  ) {
+    throw new Error(`${SYNC_CONFIG_KEY}: part_max_bytes must be a positive integer`);
   }
 
   const objectKeys = new Set(config.objects.map((object) => object.key));

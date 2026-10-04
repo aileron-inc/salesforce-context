@@ -4,14 +4,15 @@
 
 ## 最優先の設計境界
 
-- 同期は Cloudflare Worker の Cron Trigger から Bulk API 2.0 で全件取得し、結果 CSV を**加工せずそのまま** R2 に書き込む。
+- 同期は Cloudflare Worker の Cron が Queue に仕事を渡し、Workflow が Bulk API 2.0 で全件取得して、結果 CSV を R2 または Google Drive に書く。CSV の値は加工しない。大きいページはレコード境界で `part-XXXX.csv` に分ける。
 - 取得単位は Salesforce オブジェクト（SOQL）。レポートの UI CSV export は使わない。
-- **Worker のコードは org 非依存**。対象オブジェクトの SOQL と cron 割り振りは R2 バケットルートの `sync.config.json` で定義し、起動時に読み込む。リポジトリには雛形の `sync.config.example.json` のみ置き、実運用の `sync.config.json` は Git に入れない。
-- Free プランの制約（CPU 2秒・サブリクエスト 50・メモリ 128MB・Cron 最大5本）を前提に設計する。1 invocation で処理するのは1〜2オブジェクトまで。
+- **Worker のコードは org 非依存**。対象オブジェクトの SOQL と cron 割り振りは R2 バケットルートの `sync.config.json` で定義し、step ごとに読み込む。リポジトリには雛形の `sync.config.example.json` のみ置き、実運用の `sync.config.json` は Git に入れない。
+- 1 cron は 1〜2 オブジェクトまで。実処理はオブジェクトごとの Workflow に分け、失敗した step だけを再試行する。
 - `sync.config.json` の `cron_groups` のキーと `wrangler.json` の `crons` は必ず一致させる（不一致の cron は「担当なし」で何もしない）。
-- 世代は `generations/{YYYY-MM-DD-HH}/`（UTC 時まで）に書き、全オブジェクト完了後にだけ `manifest.json` を切り替える。途中失敗時は前の世代の manifest を残す。同期は1日3回（JST 2/10/18時）。
-- CSV のパース・変換（Parquet 化など）を Worker 内でやらない。変換は読み取り側の責務。
-- MCP read model、D1、Google Drive 転送は作らない（要件として削除済み）。
+- 世代は `generations/{YYYY-MM-DD-HH}/`（UTC 時まで）に書き、全オブジェクト完了後、かつその世代が現在の manifest より新しいときだけ `manifest.json` を切り替える。途中失敗時も、遅れた古い世代でも、前の世代の manifest を残す。同期は 1 日 3 回（JST 2/10/18 時）。
+- 実行プランは Workers Paid。`limits.cpu_ms` は 60000。Free の Workflow step（CPU 10ms）では大きいページを分割できない。
+- CSV の意味変換（Parquet 化など）を Worker 内でやらない。バイト境界でのパート分割と、保存先へのアップロードだけを Worker が行う。
+- MCP read model、D1、同期結果の通知は作らない。
 - Salesforce への書き戻しはしない。読み取り専用。
 - Salesforce のトークン、Client Secret、Cookie、秘密鍵、実データを Git に入れない。
 
@@ -19,13 +20,14 @@
 
 実装するもの:
 
-- Cloudflare Worker の Cron 同期（`scheduled` ハンドラ、5本の Cron で分割）
+- Cloudflare Worker の Cron が Queue にスロットを渡し、オブジェクトごとの Workflow が同期する
 - OAuth refresh token によるアクセストークン取得
-- Bulk API 2.0 query job の作成・指数バックオフでのポーリング・結果CSV取得
-- 結果 CSV の素通し保存（`maxRecords=10000` のページ = 1ファイル）
-- `_state.json` による世代内の進捗管理（invocation 内でも1オブジェクト成功ごとに `putState`）と、全件成功後の `manifest.json` 切替
-- 直近6世代を残す旧世代 cleanup
-- Workers runtime 上でのテスト（Salesforce API は fetch モック）
+- Bulk API 2.0 query job の作成、`step.sleep` を挟んだポーリング、結果 CSV 取得
+- 結果 CSV を 8 MiB 以下の `part-XXXX.csv` に分けて保存する（ヘッダ繰り返し。中身の変換はしない）
+- Drive は resumable upload（2 MiB チャンク）と、524 / 5xx / 接続断の再試行
+- R2 の `_objects/{objectKey}.json` を進捗の正とし、全オブジェクト揃ったあとだけ `manifest.json` を切り替える
+- 直近 6 世代を残す旧世代 cleanup
+- Workers runtime 上でのテスト（Salesforce API と Drive API は fetch モック）
 
 まだ実装しないもの:
 
